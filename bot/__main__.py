@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from collections import defaultdict
+from weakref import WeakValueDictionary
 
 import discord
 import httpx
@@ -20,15 +20,25 @@ class VerificationBot(discord.Client):
         intents.guilds = True
         intents.members = True
         intents.dm_messages = True
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none(), max_messages=None)
         self.config = config
         self.state = State(config.state_file)
-        self.locks = defaultdict(asyncio.Lock)
-        self.api_slots = asyncio.Semaphore(4)
+        # Active holders and waiters keep their lock alive; idle users consume no lock storage.
+        self.locks = WeakValueDictionary()
+        self.api_slots = asyncio.Semaphore(config.max_concurrent_api)
+
+    def member_lock(self, user_id):
+        lock = self.locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.locks[user_id] = lock
+        return lock
 
     async def setup_hook(self):
-        self.d1_http = httpx.AsyncClient(timeout=30)
-        self.ai_http = httpx.AsyncClient(timeout=30)
+        limits = httpx.Limits(max_connections=self.config.max_concurrent_api,
+                              max_keepalive_connections=self.config.max_concurrent_api)
+        self.d1_http = httpx.AsyncClient(timeout=30, limits=limits)
+        self.ai_http = httpx.AsyncClient(timeout=30, limits=limits)
         self.d1 = D1(self.config, self.d1_http)
         self.parser = Parser(self.config.gemini_key, self.config.model, self.ai_http)
         self.scan.change_interval(seconds=self.config.scan_seconds)
@@ -51,7 +61,7 @@ class VerificationBot(discord.Client):
     async def check_member(self, member):
         if not self.eligible(member):
             return
-        async with self.locks[member.id]:
+        async with self.member_lock(member.id):
             role = self.role(member.guild)
             if role in member.roles:
                 return
@@ -78,7 +88,7 @@ class VerificationBot(discord.Client):
             # Never log API response bodies, tokens, SQL parameters or message text.
             log.warning("Member check failed (%s)", type(exc).__name__)
 
-    @tasks.loop(seconds=300)
+    @tasks.loop(seconds=900)
     async def scan(self):
         guild = self.get_guild(self.config.guild_id)
         if guild is None:
@@ -88,7 +98,7 @@ class VerificationBot(discord.Client):
             self.role(guild)
             if not guild.chunked:
                 await guild.chunk(cache=True)
-            for member in list(guild.members):
+            for member in guild.members:
                 await self.safe_check(member)
         except Exception as exc:
             log.error("Scan failed (%s): check guild permissions and configuration", type(exc).__name__)
@@ -126,7 +136,7 @@ class VerificationBot(discord.Client):
     async def handle_dm(self, message):
         user_id = message.author.id
         text = message.content.strip()
-        async with self.locks[user_id]:
+        async with self.member_lock(user_id):
             if opted_out(text):
                 self.state.update(user_id, opted_out=1)
                 await message.channel.send("Reminders stopped. I won't DM you again unless you send START.")

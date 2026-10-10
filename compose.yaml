@@ -3,12 +3,22 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    cpus: "${BOT_CPUS:-0.5}"
+    mem_limit: "${BOT_MEMORY_LIMIT:-256m}"
+    # Match the RAM limit to disable container swap and avoid SD-card thrashing.
+    memswap_limit: "${BOT_MEMORY_LIMIT:-256m}"
+    pids_limit: 64
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "2"
     volumes:
       - bot-state:/app/data
       - ./messages:/app/messages:ro
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:size=16m,mode=1777
     cap_drop:
       - ALL
     security_opt:

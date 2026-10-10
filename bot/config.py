@@ -34,6 +34,7 @@ class Config:
     cooldown_seconds: float
     error_message_file: Path = Path("messages/error.txt")
     failure_message_file: Path = Path("messages/verification_failed.txt")
+    max_concurrent_api: int = 2
 
     @classmethod
     def load(cls):
@@ -48,6 +49,11 @@ class Config:
             if not 0 < value < float("inf"):
                 raise ValueError(f"{key} must be positive and finite")
             return value
+        def bounded_integer(key, default, maximum):
+            value = int(os.getenv(key, default))
+            if not 1 <= value <= maximum:
+                raise ValueError(f"{key} must be an integer between 1 and {maximum}")
+            return value
         config = cls(
             required("DISCORD_TOKEN"), int(required("DISCORD_GUILD_ID")),
             int(required("DISCORD_MEMBER_ROLE_ID")), required("CLOUDFLARE_ACCOUNT_ID"),
@@ -58,11 +64,12 @@ class Config:
             os.getenv("D1_STATUS_VALUE", "active"),
             Path(os.getenv("MESSAGE_FILE", "messages/verification.txt")),
             Path(os.getenv("STATE_DB", "data/state.sqlite3")),
-            positive("SCAN_INTERVAL_SECONDS", "300"),
+            positive("SCAN_INTERVAL_SECONDS", "900"),
             positive("REMINDER_INTERVAL_HOURS", "24") * 3600,
             positive("DM_COOLDOWN_SECONDS", "60"),
             Path(os.getenv("ERROR_MESSAGE_FILE", "messages/error.txt")),
             Path(os.getenv("FAILURE_MESSAGE_FILE", "messages/verification_failed.txt")),
+            bounded_integer("MAX_CONCURRENT_API", "2", 16),
         )
         for value in (config.table, config.name_column, config.email_column):
             identifier(value)

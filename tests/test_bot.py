@@ -1,13 +1,15 @@
+import asyncio
+import gc
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from bot.config import identifier
+from bot.config import Config, identifier
 from bot.services import D1, Parser, ServiceError, opted_out
 from bot.state import State
 from bot.__main__ import VerificationBot
@@ -53,6 +55,32 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(parser, "d1"))
 
 
+class ConfigTest(unittest.TestCase):
+    def load(self, **overrides):
+        env = dict(DISCORD_TOKEN="test", DISCORD_GUILD_ID="1", DISCORD_MEMBER_ROLE_ID="2",
+                   CLOUDFLARE_ACCOUNT_ID="account", CLOUDFLARE_D1_DATABASE_ID="database",
+                   CLOUDFLARE_API_TOKEN="test", GEMINI_API_KEY="test", GEMINI_MODEL="test-model")
+        env.update(overrides)
+        with patch.dict("os.environ", env, clear=True), patch("bot.config.load_dotenv"):
+            return Config.load()
+
+    def test_resource_defaults_and_overrides(self):
+        config = self.load()
+        self.assertEqual(config.scan_seconds, 900)
+        self.assertEqual(config.max_concurrent_api, 2)
+        config = self.load(SCAN_INTERVAL_SECONDS="1800", MAX_CONCURRENT_API="1")
+        self.assertEqual(config.scan_seconds, 1800)
+        self.assertEqual(config.max_concurrent_api, 1)
+
+    def test_invalid_resource_settings_fail_at_startup(self):
+        for value in ("0", "-1", "17", "1.5", "nan", ""):
+            with self.subTest(concurrency=value), self.assertRaises(ValueError):
+                self.load(MAX_CONCURRENT_API=value)
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(scan=value), self.assertRaises(ValueError):
+                self.load(SCAN_INTERVAL_SECONDS=value)
+
+
 class StateTest(unittest.TestCase):
     def test_persistence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,7 +103,7 @@ class StateTest(unittest.TestCase):
 class WorkflowTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.config = SimpleNamespace(state_file=Path(self.tmp.name) / "state.db", guild_id=1, role_id=2, reminder_seconds=86400, cooldown_seconds=60, message=lambda kind="verification": "Verify. Reply STOP.")
+        self.config = SimpleNamespace(state_file=Path(self.tmp.name) / "state.db", guild_id=1, role_id=2, reminder_seconds=86400, cooldown_seconds=60, max_concurrent_api=2, message=lambda kind="verification": "Verify. Reply STOP.")
         self.bot = VerificationBot(self.config)
         self.role = object()
         self.bot.role = lambda guild: self.role
@@ -136,3 +164,65 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             setattr(self.member, attribute, original)
         self.member.send.assert_not_awaited()
         self.bot.d1.matches.assert_not_awaited()
+
+    async def test_concurrent_checks_share_lock_and_send_one_reminder(self):
+        active = 0
+        peak = 0
+
+        async def matches(name):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.001)
+            active -= 1
+            return False
+
+        self.bot.d1.matches.side_effect = matches
+        await asyncio.gather(*(self.bot.check_member(self.member) for _ in range(5)))
+        self.assertEqual(peak, 1)
+        self.member.send.assert_awaited_once()
+        gc.collect()
+        self.assertEqual(len(self.bot.locks), 0)
+
+    async def test_api_concurrency_is_bounded_across_members(self):
+        active = 0
+        peak = 0
+
+        async def matches(name):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.001)
+            active -= 1
+            return False
+
+        self.bot.d1.matches.side_effect = matches
+        members = [SimpleNamespace(**{**vars(self.member), "id": user_id, "send": AsyncMock()})
+                   for user_id in range(10, 30)]
+        await asyncio.gather(*(self.bot.check_member(member) for member in members))
+        self.assertEqual(peak, self.config.max_concurrent_api)
+        for member in members:
+            member.send.assert_awaited_once()
+        gc.collect()
+        self.assertEqual(len(self.bot.locks), 0)
+
+    async def test_cancelled_waiter_does_not_replace_active_lock(self):
+        entered = asyncio.Event()
+
+        async def waiter():
+            entered.set()
+            async with self.bot.member_lock(3):
+                self.fail("The holder should still own the lock")
+
+        async with self.bot.member_lock(3):
+            original = self.bot.locks[3]
+            task = asyncio.create_task(waiter())
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertIs(self.bot.member_lock(3), original)
+            self.assertTrue(original.locked())
+        del original, task
+        gc.collect()
+        self.assertEqual(len(self.bot.locks), 0)
