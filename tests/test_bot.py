@@ -6,45 +6,64 @@ import tempfile
 import unittest
 import discord
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
 from bot.config import Config, identifier
+from bot.cache import MembershipCache, CacheUnavailable, REFRESH_SECONDS
 from bot.services import D1, Parser, ServiceError, opted_out
 from bot.state import State
 from bot.__main__ import VerificationBot, error_summary
 
 
 class ServicesTest(unittest.IsolatedAsyncioTestCase):
+    def cache(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cache = MembershipCache(Path(tmp.name) / "members.db")
+        self.addCleanup(cache.close)
+        return cache
+
     def d1_config(self, **overrides):
         values = dict(table="People", first_name_column="first_name", last_name_column="last_name",
                       uw_email_column="uw_email", cs_email_column="cs_email", status_column="",
                       status_value="active", account="account", database="db", cf_token="secret")
         return SimpleNamespace(**{**values, **overrides})
 
-    async def test_d1_bound_parameters_and_no_records(self):
+    async def test_d1_downloads_only_names_emails_and_binds_status(self):
         seen = []
         def handler(request):
             seen.append(json.loads(request.content))
-            return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [{"matched": 1}]}]})
-        config = self.d1_config(status_column="status")
+            return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [
+                {"full_name": "Robert'; DROP TABLE members;--", "uw_email": "r@example.com", "cs_email": None}]}]})
+        config = self.d1_config(status_column="status", status_value="active' OR 1=1 --")
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            d1 = D1(config, client)
+            cache = self.cache()
+            d1 = D1(config, client, cache)
+            await d1.refresh()
             self.assertTrue(await d1.matches("Robert'; DROP TABLE members;--", "r@example.com"))
-        self.assertEqual(seen[0]["params"], ["Robert'; DROP TABLE members;--", "r@example.com", "r@example.com", "active"])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["params"], [config.status_value])
         self.assertNotIn("Robert", seen[0]["sql"])
-        self.assertIn("SELECT 1 AS matched", seen[0]["sql"])
+        self.assertNotIn(config.status_value, seen[0]["sql"])
+        self.assertNotIn("status", seen[0]["sql"].split(" FROM ")[0])
+        self.assertEqual([row[1] for row in cache.db.execute("PRAGMA table_info(members)")],
+                         ["full_name", "uw_email", "cs_email"])
 
     async def test_duplicates_and_api_failure_fail_closed(self):
         config = self.d1_config()
         for count in (0, 2):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [{}] * count}]}))) as client:
-                self.assertFalse(await D1(config, client).matches("Jane Doe"))
+            record = {"full_name": "Jane Doe", "uw_email": "jane@example.com", "cs_email": None}
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [record] * count}]}))) as client:
+                d1 = D1(config, client, self.cache())
+                await d1.refresh()
+                self.assertFalse(await d1.matches("Jane Doe"))
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"success": False}))) as client:
             with self.assertRaises(ServiceError):
-                await D1(config, client).matches("Jane Doe")
+                await D1(config, client, self.cache()).refresh()
 
     async def test_people_schema_matching(self):
         db = sqlite3.connect(":memory:")
@@ -65,7 +84,7 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(request.content)
             rows = db.execute(payload["sql"], payload["params"]).fetchall()
             return httpx.Response(200, json={"success": True, "result": [
-                {"success": True, "results": [{"matched": row[0]} for row in rows]}]})
+                {"success": True, "results": [dict(zip(("full_name", "uw_email", "cs_email"), row)) for row in rows]}]})
 
         cases = [
             (" jane doe ", None, True),
@@ -86,11 +105,99 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
             ("Jane Doe' OR 1=1 --", "jane@uw.edu", False),
         ]
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            d1 = D1(self.d1_config(status_column="status"), client)
+            d1 = D1(self.d1_config(status_column="status"), client, self.cache())
+            await d1.refresh()
             for name, email, expected in cases:
                 with self.subTest(name=name, email=email):
                     self.assertEqual(await d1.matches(name, email), expected)
-            self.assertTrue(await D1(self.d1_config(), client).matches("Inactive Member"))
+            unfiltered = D1(self.d1_config(), client, self.cache())
+            await unfiltered.refresh()
+            self.assertTrue(await unfiltered.matches("Inactive Member"))
+
+    async def test_refresh_six_hour_boundary_concurrency_and_restart(self):
+        records = [{"full_name": "Jane Doe", "uw_email": "jane@example.com", "cs_email": None}]
+        calls = []
+
+        async def handler(request):
+            calls.append(request)
+            await asyncio.sleep(0)
+            return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": records}]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "members.db"
+            cache = MembershipCache(path)
+            try:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    with patch("bot.services.time.time", return_value=1000) as now:
+                        d1 = D1(self.d1_config(), client, cache)
+                        with self.assertRaises(CacheUnavailable):
+                            await d1.matches("Jane Doe")
+                        await asyncio.gather(*(d1.refresh() for _ in range(10)))
+                        self.assertEqual(len(calls), 1)
+                        self.assertTrue(await d1.matches("Jane Doe"))
+                        cache.close()
+                        cache = MembershipCache(path)
+                        d1 = D1(self.d1_config(), client, cache)
+                        now.return_value = 1000 + REFRESH_SECONDS - 1
+                        self.assertFalse(await d1.refresh())
+                        self.assertTrue(await d1.matches("Jane Doe"))
+                        self.assertFalse(await d1.matches("New Member"))
+                        self.assertEqual(len(calls), 1)
+                        now.return_value += 1
+                        with self.assertRaises(CacheUnavailable):
+                            await d1.matches("Jane Doe")
+                        records[:] = [{"full_name": "New Member", "uw_email": None, "cs_email": "new@example.com"}]
+                        self.assertTrue(await d1.refresh())
+                        self.assertEqual(len(calls), 2)
+                        self.assertFalse(await d1.matches("Jane Doe"))
+                        self.assertTrue(await d1.matches("New Member", "new@example.com"))
+            finally:
+                cache.close()
+
+    async def test_failed_refresh_keeps_snapshot_but_denies_stale_matches(self):
+        cache = self.cache()
+        record = {"full_name": "Jane Doe", "uw_email": "jane@example.com", "cs_email": None}
+        response = {"success": True, "result": [{"success": True, "results": [record]}]}
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json=response)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch("bot.services.time.time", return_value=1000) as now:
+                d1 = D1(self.d1_config(), client, cache)
+                await d1.refresh()
+                now.return_value += REFRESH_SECONDS
+                response["result"][0]["results"] = [record, {"full_name": "Incomplete"}]
+                with self.assertRaises(ServiceError):
+                    await d1.refresh()
+                self.assertEqual(cache.db.execute("SELECT full_name FROM members").fetchall(), [("Jane Doe",)])
+                self.assertFalse(await d1.refresh())
+                with self.assertRaises(CacheUnavailable):
+                    await d1.matches("Jane Doe")
+                self.assertEqual(len(calls), 2)
+                now.return_value += REFRESH_SECONDS
+                response["result"][0]["results"] = []
+                self.assertTrue(await d1.refresh())
+                self.assertFalse(await d1.matches("Jane Doe"))
+                self.assertEqual(cache.db.execute("SELECT COUNT(*) FROM members").fetchone()[0], 0)
+
+    async def test_first_refresh_network_failure_is_not_retried_on_restart(self):
+        cache = self.cache()
+        path = Path(cache.db.execute("PRAGMA database_list").fetchone()[2])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))) as client:
+            with patch("bot.services.time.time", return_value=1000):
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await D1(self.d1_config(), client, cache).refresh()
+                cache.close()
+                restarted_cache = MembershipCache(path)
+                try:
+                    self.assertFalse(await D1(self.d1_config(), client, restarted_cache).refresh())
+                    with self.assertRaises(CacheUnavailable):
+                        await D1(self.d1_config(), client, restarted_cache).matches("Jane Doe")
+                finally:
+                    restarted_cache.close()
 
     async def test_parser_boundary_and_hallucination(self):
         seen = []
@@ -130,6 +237,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_resource_defaults_and_overrides(self):
         config = self.load()
+        self.assertEqual(config.cache_file, Path("data/members.sqlite3"))
+        self.assertEqual(self.load(MEMBERSHIP_CACHE_DB="data/custom.db").cache_file, Path("data/custom.db"))
         self.assertEqual(config.scan_seconds, 900)
         self.assertEqual(config.max_concurrent_api, 2)
         self.assertEqual(config.max_api_per_minute, 60)
@@ -154,6 +263,31 @@ class ConfigTest(unittest.TestCase):
         for value in ("0", "601", "nan"):
             with self.subTest(budget=value), self.assertRaises(ValueError):
                 self.load(MAX_API_PER_MINUTE=value)
+
+
+class CacheLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_refresh_restart_reuse_and_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = replace(ConfigTest().load(), state_file=Path(tmp) / "state.db",
+                             cache_file=Path(tmp) / "members.db")
+            client = SimpleNamespace(post=AsyncMock(return_value=httpx.Response(
+                200, request=httpx.Request("POST", "https://api.cloudflare.com"),
+                json={"success": True, "result": [{"success": True, "results": [
+                    {"full_name": "Jane Doe", "uw_email": "jane@example.com", "cs_email": None}]}]})),
+                aclose=AsyncMock())
+            with patch("bot.__main__.httpx.AsyncClient", return_value=client):
+                for _ in range(2):
+                    bot = VerificationBot(config)
+                    try:
+                        await bot.setup_hook()
+                        self.assertTrue(bot.refresh_membership.is_running())
+                        self.assertTrue(await bot.d1.matches("Jane Doe"))
+                        client.post.assert_awaited_once()
+                    finally:
+                        await bot.close()
+                    self.assertTrue(bot.refresh_membership.get_task().done())
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        bot.membership_cache.db.execute("SELECT 1")
 
 
 class StateTest(unittest.TestCase):

@@ -9,6 +9,10 @@ The membership source is the `People` table in `cseed-membership`. Full names ar
 
 See [the security review](SECURITY_REVIEW.md) for safeguards, accepted risks, and validation results. Do not use this matching policy to protect sensitive information or privileged operations.
 
+The bot downloads eligible names and emails from D1 on first startup, then at most once every six hours. All name and DM matching uses a local SQLite snapshot at `data/members.sqlite3`. It contains full names and the two email fields, plus a separate table of refresh deadlines; no other source fields are downloaded or stored. The optional status filter runs in D1. Refresh attempts are reserved on disk before the request, so failures and restarts do not bypass the six-hour limit. A background task checks the local deadline every minute, including when no members need verification.
+
+Each successful refresh replaces the snapshot atomically, including removing deleted or newly ineligible records. An empty result clears it. If a refresh fails, the previous snapshot remains on disk but expired records cannot grant roles; verification resumes after a successful scheduled refresh. On an initial failure, verification is unavailable until the next attempt six hours later. Source or configuration changes become effective at the next successful refresh, followed by a member check; already assigned roles are not revoked.
+
 ## Prerequisites
 
 - A Discord server where you can install a bot and manage roles.
@@ -62,7 +66,7 @@ The bot handles one configured server and assigns the selected role. It does not
 1. In the Cloudflare dashboard, select the account that owns your D1 database. Copy its account ID into `CLOUDFLARE_ACCOUNT_ID`.
 2. Open the `cseed-membership` D1 database and copy its database ID into `CLOUDFLARE_D1_DATABASE_ID`. Use the database UUID, not `cseed-membership` itself or a Worker binding name.
 3. Create a custom API token scoped to that account with **D1 Read** permission, then save it as `CLOUDFLARE_API_TOKEN`. The [D1 query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/) accepts this permission. The bot issues only `SELECT` queries and never changes membership records.
-4. Use the schema settings below for the existing `People` table with `first_name`, `last_name`, `uw_email`, and `cs_email` columns. These are also the defaults. The bot does not create a D1 database, import a membership list, or run migrations.
+4. Use the schema settings below for the existing `People` table with `first_name`, `last_name`, `uw_email`, and `cs_email` columns. These are also the defaults. The bot creates its local cache automatically and does not change the D1 schema or records.
 
 Set these values in `.env` (replace the previous `D1_NAME_COLUMN` and `D1_EMAIL_COLUMN` settings):
 
@@ -86,7 +90,7 @@ Table and column names must start with a letter or underscore and contain only l
 2. Copy the key into `GEMINI_API_KEY` in `.env`.
 3. Set `GEMINI_MODEL` to an API model ID available to that project with [structured output support](https://ai.google.dev/gemini-api/docs/structured-output). The template uses `gemini-3.8-flash`. Use the bare model ID, without a `models/` prefix, and confirm your project has quota for it.
 
-Gemini extracts a full name and email from a member's DM. Name-only checks query D1 directly, but both Gemini settings are required at startup. Review the data boundary below before deploying because verification DMs are sent to Google.
+Gemini extracts a full name and email from a member's DM. Name-only checks search the local cache without Gemini, but both Gemini settings are required at startup. Review the data boundary below before deploying because verification DMs are sent to Google.
 
 ### 5. Customize the messages
 
@@ -132,6 +136,7 @@ Optional settings and their defaults:
 | `ERROR_MESSAGE_FILE` | `messages/error.txt` | Temporary-error text. |
 | `FAILURE_MESSAGE_FILE` | `messages/verification_failed.txt` | Unsuccessful-verification text. |
 | `STATE_DB` | `data/state.sqlite3` | Local SQLite state, separate from D1. |
+| `MEMBERSHIP_CACHE_DB` | `data/members.sqlite3` | Local names/email snapshot and persistent six-hour refresh deadlines. |
 | `SCAN_INTERVAL_SECONDS` | `900` | Seconds between scans of server members. |
 | `REMINDER_INTERVAL_HOURS` | `24` | Hours between automatic reminder attempts; values below 24 are rejected. |
 | `DM_COOLDOWN_SECONDS` | `60` | Separate per-user cooldowns for verification replies, automatic name checks, and command acknowledgments. |
@@ -181,9 +186,9 @@ DM parsing and automatic name checks have separate persistent per-user cooldowns
 
 At most two workflows run concurrently by default, each with a 60-second deadline. Duplicate events and work arriving at capacity are dropped; retry a DM later, while member checks retry on a later scan. Uncached users and users outside the configured server are ignored before any REST calls, replies, or state writes. The background scan loads the member cache after connection.
 
-Name checks and DM verification share a default budget of 60 workflows per rolling minute. A name workflow performs at most three D1 queries; a DM workflow performs at most one Gemini call and one D1 query. This budget resets on process restart; per-user cooldowns persist. Scans pause when the budget is exhausted so later members can still be checked. Rate limits constrain abuse but are not a daily spending cap; configure provider quotas as well.
+Name checks and DM verification share a default budget of 60 workflows per rolling minute. A name workflow performs at most three local cache lookups; a DM workflow performs at most one Gemini call and one local lookup. Neither queries D1. The separate background refresh makes one D1 query per six-hour window. The workflow budget resets on process restart; per-user cooldowns and the D1 refresh deadline persist. Scans pause when the budget is exhausted so later members can still be checked. Rate limits constrain abuse but are not a daily spending cap; configure provider quotas as well.
 
-Invalid, missing, or ambiguous details produce a generic failure without revealing whether a name/email exists. An administrator should monitor logs for configuration/API errors; logs record error types without message contents or API response bodies. Large servers may need a longer scan interval and an indexed membership schema to control D1 cost. Membership, screening, target-role permissions, and the matched Discord name (for name-based checks) are checked again immediately before granting the role.
+Invalid, missing, or ambiguous details produce a generic failure without revealing whether a name/email exists. An administrator should monitor logs for configuration/API errors; logs record error types without message contents or API response bodies. Each D1 refresh downloads the complete eligible names/email snapshot in one request, so it must fit the provider's response limits and the bot's available memory. Membership, screening, target-role permissions, and the matched Discord name (for name-based checks) are checked again immediately before granting the role.
 
 ## Resource usage
 
@@ -192,7 +197,7 @@ The supplied defaults reduce steady resource use:
 - **256 MiB RAM ceiling** for the container, with swap disabled to avoid swapping to disk. This is a limit, not a measured memory requirement or a reservation.
 - **0.5 CPU core maximum** for the container, leaving the host's other CPU capacity available. This does not mean half of the entire host's CPU capacity.
 - **Two concurrent API workflows** and small reusable HTTP connection pools.
-- **15-minute scans**, reducing scheduled scans from 288 to 96 per day compared with the previous five-minute default. Discord events still trigger checks immediately. Membership changes made only in D1 may take until the next scan to be detected.
+- **15-minute scans** against the local cache. Discord events still trigger checks immediately. Membership changes made in D1 may take six hours to refresh, plus up to a minute of scheduling delay and the next scan to be detected.
 - **No Discord message-history cache**, and per-user locks are released once no active task needs them. The Discord member cache remains enabled for scans and member events, so memory still grows with server size.
 - **Rotating Docker logs**, configured for two 5 MB files with the local logging driver, plus a 16 MiB temporary filesystem and a 64-process limit. SQLite preferences remain persistent in the state volume.
 
@@ -213,9 +218,9 @@ Measure actual usage with `docker compose stats bot` after startup and during a 
 
 ## Data boundary
 
-Gemini receives only a fixed extraction instruction, a JSON schema, and the user's current DM. It has no tools, D1 credentials, database records, Discord identifiers, conversation history, or verification results. Its only output is a name and email. The bot checks output types, lengths, email shape, and whether the extracted values appear in the original reply before passing them as bound D1 query parameters. D1 returns only up to two constant match markers, never member rows. Separate HTTP clients isolate service headers.
+Gemini receives only a fixed extraction instruction, a JSON schema, and the user's current DM. It has no tools, D1 credentials, database records, Discord identifiers, conversation history, or verification results. Its only output is a name and email. The bot checks output types, lengths, email shape, and whether the extracted values appear in the original reply before passing them as bound local SQLite query parameters. D1 supplies only eligible full names and email fields during the scheduled refresh. Separate HTTP clients isolate service headers.
 
-The submitted DM itself contains personal information and is sent to Google for parsing; database privacy does not mean the submitted details stay local. Raw replies, extracted names, and emails are not stored locally or logged by this application. Discord and Google have their own data handling policies. Local SQLite stores Discord user IDs, opt-out flags, and timing fields only. Service credentials remain in the bot process, never in model requests except the Gemini API key authentication header.
+The submitted DM itself contains personal information and is sent to Google for parsing; database privacy does not mean the submitted details stay local. Raw replies and extracted DM details are not persisted or logged. Discord and Google have their own data handling policies. The state database stores Discord user IDs, opt-out flags, and timing fields. The separate membership cache persists names and emails downloaded from D1, with no Discord IDs or links to user records. Protect the cache and its backups as personal data. Service credentials remain in the bot process, never in model requests except the Gemini API key authentication header.
 
 ## Local development and tests
 
@@ -251,8 +256,9 @@ Tests use fake Discord members and mock HTTP services; they do not contact your 
 | Discord login or privileged-intent failure | Check the bot token and enable Server Members Intent in the Developer Portal. |
 | `Configured guild unavailable` | Confirm the server ID and that the bot has been invited to that server. |
 | `Scan failed (RuntimeError)` or a role assignment fails | Check the target role ID, Manage Roles permission, and that the bot's highest role is above the target. The target must be a normal assignable role. |
-| `Member check failed (Cloudflare D1 HTTP ...)` | Check the Cloudflare account/database IDs, token permissions, API availability, and quota. |
-| `DM handling failed (Gemini HTTP ...)` or `(Cloudflare D1 HTTP ...)` | The service and HTTP status identify the failing request. Check that service's credentials, configuration, and quota. URLs, credentials, message text, and response bodies are not logged. |
+| `Membership refresh failed (Cloudflare D1 HTTP ...)` | Check the Cloudflare account/database IDs, token permissions, API availability, and quota. The next attempt remains scheduled six hours after the failed attempt. |
+| `Member check failed (CacheUnavailable)` or `DM handling failed (CacheUnavailable)` | No fresh membership snapshot is available. Check refresh logs; verification resumes after a successful scheduled refresh. |
+| `DM handling failed (Gemini HTTP ...)` | Check Gemini credentials, configuration, and quota. URLs, credentials, message text, and response bodies are not logged. |
 | DM verification returns a temporary error | Check both D1 and Gemini credentials, the model ID, service quotas, and schema configuration. Logs intentionally omit API response bodies. |
 | A known member does not match | Check spelling, the configured columns and status filter, and duplicate eligible records. Matching is not fuzzy and does not remove accents. |
 | A DM reply is ignored | Check the reply cooldown, whether the user sent `STOP`, whether they already have the role, and whether they completed membership screening. Send `START` to clear an opt-out. |
@@ -301,4 +307,4 @@ docker compose up -d bot
 
 Use `up -d --build` after pulling code changes, and `up -d --force-recreate` after editing `.env`. A [Compose restart](https://docs.docker.com/reference/cli/docker/compose/restart/) does not apply changed environment values. Editing the existing message files takes effect on their next send without either command.
 
-The `bot-state` named volume stores opt-outs, reminder deadlines, and reply cooldowns. Ordinary rebuilds, recreation, and `docker compose down` retain it. **Do not add `-v` / `--volumes` to `docker compose down` unless you intend to delete that state**, including users' opt-outs. See [Compose down's volume behavior](https://docs.docker.com/reference/cli/docker/compose/down/). Keep the same Compose project name when redeploying to reuse the existing volume. The membership records themselves stay in Cloudflare D1.
+The `bot-state` named volume stores opt-outs, reminder deadlines, reply cooldowns, and the names/email cache with its refresh schedule. Ordinary rebuilds, recreation, and `docker compose down` retain it. **Do not add `-v` / `--volumes` to `docker compose down` unless you intend to delete that state**, including users' opt-outs. See [Compose down's volume behavior](https://docs.docker.com/reference/cli/docker/compose/down/). Keep the same Compose project name when redeploying to reuse the existing volume. Cloudflare D1 remains the source of truth; only names and emails are copied locally.

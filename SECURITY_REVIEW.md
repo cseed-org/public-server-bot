@@ -2,6 +2,8 @@
 
 Reviewed the Python application, Discord event and DM handlers, D1 SQL construction, Gemini boundary, SQLite state, dependencies, Docker configuration, and tracked configuration files. This was a source review and mocked regression testing, not a penetration test of the deployed server. No live bot was started and no member was contacted.
 
+Subsequent cache change: membership lookups now use a persistent local SQLite snapshot of eligible full names and both email fields. D1 is queried at most once every six hours, with the attempt deadline committed before each request and preserved across restarts. The cache includes local timing metadata but no other source fields or Discord identifiers. Expired snapshots cannot authorize new role grants. The original review's statements below about storing only IDs/preferences apply to `state.sqlite3`; `members.sqlite3` and its backups now also contain personal data. The dependency audit below has not been rerun as part of this change.
+
 ## Findings and disposition
 
 | Severity | Finding | Disposition |

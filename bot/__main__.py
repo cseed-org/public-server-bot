@@ -10,6 +10,7 @@ import httpx
 from discord.ext import tasks
 
 from .config import Config
+from .cache import MembershipCache
 from .services import D1, Parser, normalized, opted_out
 from .state import State
 
@@ -73,10 +74,22 @@ class VerificationBot(discord.Client):
                               max_keepalive_connections=self.config.max_concurrent_api)
         self.d1_http = httpx.AsyncClient(timeout=30, limits=limits)
         self.ai_http = httpx.AsyncClient(timeout=30, limits=limits)
-        self.d1 = D1(self.config, self.d1_http)
+        self.membership_cache = MembershipCache(self.config.cache_file)
+        self.d1 = D1(self.config, self.d1_http, self.membership_cache)
         self.parser = Parser(self.config.gemini_key, self.config.model, self.ai_http)
+        await self.refresh_membership()
+        self.refresh_membership.start()
         self.scan.change_interval(seconds=self.config.scan_seconds)
         self.scan.start()
+
+    @tasks.loop(seconds=60)
+    async def refresh_membership(self):
+        # Poll only local timing metadata; D1 enforces the persisted six-hour gate.
+        try:
+            if await self.d1.refresh():
+                log.info("Membership cache refreshed")
+        except Exception as exc:
+            log.warning("Membership refresh failed (%s); next attempt in six hours", error_summary(exc))
 
     def role(self, guild):
         role = guild.get_role(self.config.role_id)
@@ -105,7 +118,7 @@ class VerificationBot(discord.Client):
             return False
         if matched_name is not None and matched_name not in (member.nick, member.global_name, member.name):
             return False
-        await member.add_roles(role, reason="Membership matched in D1")
+        await member.add_roles(role, reason="Membership matched in cached D1 records")
         log.info("Membership role granted")
         return True
 
@@ -255,19 +268,23 @@ class VerificationBot(discord.Client):
         log.error("Discord event failed: %s", event_method)
 
     async def close(self):
-        self.scan.cancel()
-        task = self.scan.get_task()
-        if task:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for loop in (self.scan, self.refresh_membership):
+            loop.cancel()
+            task = loop.get_task()
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await super().close()
         for name in ("d1_http", "ai_http"):
             client = getattr(self, name, None)
             if client:
                 await client.aclose()
         self.state.close()
+        cache = getattr(self, "membership_cache", None)
+        if cache:
+            cache.close()
 
 
 def main():

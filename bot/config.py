@@ -38,6 +38,7 @@ class Config:
     failure_message_file: Path = Path("messages/verification_failed.txt")
     max_concurrent_api: int = 2
     max_api_per_minute: int = 60
+    cache_file: Path = Path("data/members.sqlite3")
 
     @classmethod
     def load(cls):
@@ -78,6 +79,7 @@ class Config:
             Path(os.getenv("FAILURE_MESSAGE_FILE", "messages/verification_failed.txt")),
             bounded_integer("MAX_CONCURRENT_API", "2", 16),
             bounded_integer("MAX_API_PER_MINUTE", "60", 600),
+            Path(os.getenv("MEMBERSHIP_CACHE_DB", "data/members.sqlite3")),
         )
         if config.reminder_seconds < 86400:
             raise ValueError("REMINDER_INTERVAL_HOURS must be at least 24")

@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import unicodedata
 
 import httpx
@@ -27,27 +28,30 @@ class ServiceError(Exception):
 
 
 class D1:
-    def __init__(self, config, client):
-        self.config, self.client = config, client
+    def __init__(self, config, client, cache):
+        self.config, self.client, self.cache = config, client, cache
 
     async def matches(self, name, email=None):
+        return self.cache.matches(name, email, time.time())
+
+    async def refresh(self):
+        if not self.cache.reserve_refresh(time.time()):
+            return False
         c = self.config
         # Values are bound parameters. Only vetted administrator identifiers enter SQL.
         full_name = (f"trim({identifier(c.first_name_column)}) || ' ' || "
                      f"trim({identifier(c.last_name_column)})")
-        where = f"lower({full_name}) = lower(trim(?))"
-        params = [name.strip()]
-        if email is not None:
-            where += (f" AND (lower(trim({identifier(c.uw_email_column)})) = lower(trim(?))"
-                      f" OR lower(trim({identifier(c.cs_email_column)})) = lower(trim(?)))")
-            params.extend([email.strip(), email.strip()])
+        sql = (f"SELECT {full_name} AS full_name, "
+               f"{identifier(c.uw_email_column)} AS uw_email, "
+               f"{identifier(c.cs_email_column)} AS cs_email FROM {identifier(c.table)}")
+        params = []
         if c.status_column:
-            where += f" AND {identifier(c.status_column)} = ?"
+            sql += f" WHERE {identifier(c.status_column)} = ?"
             params.append(c.status_value)
         response = await self.client.post(
             f"https://api.cloudflare.com/client/v4/accounts/{c.account}/d1/database/{c.database}/query",
             headers={"Authorization": f"Bearer {c.cf_token}"},
-            json={"sql": f"SELECT 1 AS matched FROM {identifier(c.table)} WHERE {where} LIMIT 2", "params": params},
+            json={"sql": sql, "params": params},
         )
         response.raise_for_status()
         body = response.json()
@@ -56,7 +60,16 @@ class D1:
         result = body["result"][0]
         if not result.get("success") or not isinstance(result.get("results"), list):
             raise ServiceError("Invalid D1 result")
-        return len(result["results"]) == 1
+        rows = []
+        for record in result["results"]:
+            if not isinstance(record, dict) or not {"full_name", "uw_email", "cs_email"} <= record.keys():
+                raise ServiceError("Invalid D1 record")
+            row = tuple(record[key] for key in ("full_name", "uw_email", "cs_email"))
+            if any(value is not None and not isinstance(value, str) for value in row):
+                raise ServiceError("Invalid D1 record")
+            rows.append(row)
+        self.cache.replace(rows)
+        return True
 
 
 class Parser:
@@ -103,7 +116,7 @@ class Parser:
             name, email = name.strip(), email.strip()
             if not 2 <= len(name) <= 200 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
                 return None
-            # Ground extraction in the actual reply before querying D1.
+            # Ground extraction in the actual reply before searching the cache.
             if normalized(name) not in normalized(reply) or normalized(email) not in normalized(reply):
                 return None
             return name, email
