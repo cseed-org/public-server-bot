@@ -18,27 +18,79 @@ from bot.__main__ import VerificationBot
 
 
 class ServicesTest(unittest.IsolatedAsyncioTestCase):
+    def d1_config(self, **overrides):
+        values = dict(table="People", first_name_column="first_name", last_name_column="last_name",
+                      uw_email_column="uw_email", cs_email_column="cs_email", status_column="",
+                      status_value="active", account="account", database="db", cf_token="secret")
+        return SimpleNamespace(**{**values, **overrides})
+
     async def test_d1_bound_parameters_and_no_records(self):
         seen = []
         def handler(request):
             seen.append(json.loads(request.content))
             return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [{"matched": 1}]}]})
-        config = SimpleNamespace(table="members", name_column="full_name", email_column="email", status_column="status", status_value="active", account="account", database="db", cf_token="secret")
+        config = self.d1_config(status_column="status")
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             d1 = D1(config, client)
             self.assertTrue(await d1.matches("Robert'; DROP TABLE members;--", "r@example.com"))
-        self.assertEqual(seen[0]["params"], ["Robert'; DROP TABLE members;--", "r@example.com", "active"])
+        self.assertEqual(seen[0]["params"], ["Robert'; DROP TABLE members;--", "r@example.com", "r@example.com", "active"])
         self.assertNotIn("Robert", seen[0]["sql"])
         self.assertIn("SELECT 1 AS matched", seen[0]["sql"])
 
     async def test_duplicates_and_api_failure_fail_closed(self):
-        config = SimpleNamespace(table="members", name_column="full_name", email_column="email", status_column="", account="a", database="d", cf_token="s")
+        config = self.d1_config()
         for count in (0, 2):
             async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"success": True, "result": [{"success": True, "results": [{}] * count}]}))) as client:
                 self.assertFalse(await D1(config, client).matches("Jane Doe"))
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"success": False}))) as client:
             with self.assertRaises(ServiceError):
                 await D1(config, client).matches("Jane Doe")
+
+    async def test_people_schema_matching(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE People (first_name TEXT, last_name TEXT, uw_email TEXT, cs_email TEXT, status TEXT)")
+        db.executemany("INSERT INTO People VALUES (?, ?, ?, ?, ?)", [
+            (" Jane ", " Doe ", " Jane@uw.edu ", "jane@cs.edu", "active"),
+            ("Alex", "Smith", None, "alex@cs.edu", "active"),
+            ("Sam", "Lee", "sam@uw.edu", None, "active"),
+            ("Inactive", "Member", "inactive@uw.edu", "inactive@cs.edu", "inactive"),
+            ("Same", "Email", "same@example.com", "same@example.com", "active"),
+            ("Duplicate", "Name", "one@uw.edu", "shared@cs.edu", "active"),
+            ("Duplicate", "Name", "two@uw.edu", "shared@cs.edu", "active"),
+            ("Mary Ann", "Van Buren", "mary@uw.edu", None, "active"),
+        ])
+
+        def handler(request):
+            payload = json.loads(request.content)
+            rows = db.execute(payload["sql"], payload["params"]).fetchall()
+            return httpx.Response(200, json={"success": True, "result": [
+                {"success": True, "results": [{"matched": row[0]} for row in rows]}]})
+
+        cases = [
+            (" jane doe ", None, True),
+            ("Jane Doe", " JANE@UW.EDU ", True),
+            ("Jane Doe", "JANE@CS.EDU", True),
+            ("Alex Smith", "alex@cs.edu", True),
+            ("Sam Lee", "sam@uw.edu", True),
+            ("Jane Doe", "alex@cs.edu", False),
+            ("Wrong Name", "jane@cs.edu", False),
+            ("Inactive Member", None, False),
+            ("Inactive Member", "inactive@uw.edu", False),
+            ("Inactive Member", "inactive@cs.edu", False),
+            ("Same Email", "same@example.com", True),
+            ("Duplicate Name", None, False),
+            ("Duplicate Name", "shared@cs.edu", False),
+            ("Duplicate Name", "one@uw.edu", True),
+            ("Mary Ann Van Buren", "mary@uw.edu", True),
+            ("Jane Doe' OR 1=1 --", "jane@uw.edu", False),
+        ]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            d1 = D1(self.d1_config(status_column="status"), client)
+            for name, email, expected in cases:
+                with self.subTest(name=name, email=email):
+                    self.assertEqual(await d1.matches(name, email), expected)
+            self.assertTrue(await D1(self.d1_config(), client).matches("Inactive Member"))
 
     async def test_parser_boundary_and_hallucination(self):
         seen = []
@@ -65,6 +117,16 @@ class ConfigTest(unittest.TestCase):
         env.update(overrides)
         with patch.dict("os.environ", env, clear=True), patch("bot.config.load_dotenv"):
             return Config.load()
+
+    def test_people_schema_defaults_and_identifier_validation(self):
+        config = self.load()
+        self.assertEqual(config.table, "People")
+        for field in ("first_name", "last_name", "uw_email", "cs_email"):
+            self.assertEqual(getattr(config, field + "_column"), field)
+            key = "D1_" + field.upper() + "_COLUMN"
+            self.assertEqual(getattr(self.load(**{key: "custom_column"}), field + "_column"), "custom_column")
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.load(**{key: "column; DROP TABLE People"})
 
     def test_resource_defaults_and_overrides(self):
         config = self.load()

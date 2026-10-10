@@ -5,7 +5,7 @@ A Dockerized Python bot for one Discord server. It checks new members, name chan
 - A server nickname, global display name, or username matches exactly one eligible full-name record.
 - A DM contains a full name and email matching exactly one eligible record together.
 
-Matching trims surrounding spaces and ignores ASCII case using SQLite `lower`. It does not use fuzzy matching or remove accents. Duplicate matches fail closed. A name match is the requested trust policy, **not proof of identity**; anyone who knows a listed name can use it. Email ownership is not verified either.
+The membership source is the `People` table in `cseed-membership`. Full names are built from trimmed `first_name` and `last_name` values separated by one space. DM verification accepts either `uw_email` or `cs_email` on the same row as the matching name. Matching trims surrounding spaces and ignores ASCII case using SQLite `lower`. It does not use fuzzy matching or remove accents. Duplicate matches fail closed. A name match is the requested trust policy, **not proof of identity**; anyone who knows a listed name can use it. Email ownership is not verified either.
 
 See [the security review](SECURITY_REVIEW.md) for safeguards, accepted risks, and validation results. Do not use this matching policy to protect sensitive information or privileged operations.
 
@@ -60,21 +60,23 @@ The bot handles one configured server and assigns the selected role. It does not
 ### 3. Connect your Cloudflare D1 membership database
 
 1. In the Cloudflare dashboard, select the account that owns your D1 database. Copy its account ID into `CLOUDFLARE_ACCOUNT_ID`.
-2. Open that D1 database and copy its database ID into `CLOUDFLARE_D1_DATABASE_ID`. Use the database UUID, not its display name or a Worker binding name.
+2. Open the `cseed-membership` D1 database and copy its database ID into `CLOUDFLARE_D1_DATABASE_ID`. Use the database UUID, not `cseed-membership` itself or a Worker binding name.
 3. Create a custom API token scoped to that account with **D1 Read** permission, then save it as `CLOUDFLARE_API_TOKEN`. The [D1 query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/) accepts this permission. The bot issues only `SELECT` queries and never changes membership records.
-4. Inspect your existing table and set `D1_TABLE`, `D1_NAME_COLUMN`, and `D1_EMAIL_COLUMN` to its actual names. The defaults expect a table named `members` with `full_name` and `email` columns. The bot does not create a D1 database, import a membership list, or run migrations.
+4. Use the schema settings below for the existing `People` table with `first_name`, `last_name`, `uw_email`, and `cs_email` columns. These are also the defaults. The bot does not create a D1 database, import a membership list, or run migrations.
 
-For example, if your existing schema is `members(full_name TEXT, email TEXT, status TEXT)`, use:
+Set these values in `.env` (replace the previous `D1_NAME_COLUMN` and `D1_EMAIL_COLUMN` settings):
 
 ```dotenv
-D1_TABLE=members
-D1_NAME_COLUMN=full_name
-D1_EMAIL_COLUMN=email
-D1_STATUS_COLUMN=status
+D1_TABLE=People
+D1_FIRST_NAME_COLUMN=first_name
+D1_LAST_NAME_COLUMN=last_name
+D1_UW_EMAIL_COLUMN=uw_email
+D1_CS_EMAIL_COLUMN=cs_email
+D1_STATUS_COLUMN=
 D1_STATUS_VALUE=active
 ```
 
-This example limits verification to rows whose status equals `active`. Status matching uses a direct SQL equality comparison; unlike name/email matching, the bot does not trim or lowercase it. If every row is eligible, leave `D1_STATUS_COLUMN=` blank; `D1_STATUS_VALUE` is then ignored.
+With `D1_STATUS_COLUMN=` blank, every row is eligible and `D1_STATUS_VALUE` is ignored. If you later add an eligibility column, set `D1_STATUS_COLUMN` to its name and `D1_STATUS_VALUE` to the required value. Status matching uses a direct SQL equality comparison; unlike name/email matching, the bot does not trim or lowercase it.
 
 Table and column names must start with a letter or underscore and contain only letters, digits, and underscores. Do not include SQL expressions, spaces, or schema prefixes. Each lookup must match exactly one eligible row; duplicate names can prevent automatic name verification, while a unique name-and-email pair may still verify by DM.
 
@@ -119,9 +121,11 @@ Optional settings and their defaults:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `D1_TABLE` | `members` | Membership table. |
-| `D1_NAME_COLUMN` | `full_name` | Full-name column. |
-| `D1_EMAIL_COLUMN` | `email` | Email column. |
+| `D1_TABLE` | `People` | Membership table in `cseed-membership`. |
+| `D1_FIRST_NAME_COLUMN` | `first_name` | First-name column. |
+| `D1_LAST_NAME_COLUMN` | `last_name` | Last-name column. |
+| `D1_UW_EMAIL_COLUMN` | `uw_email` | UW email column; either email can match. |
+| `D1_CS_EMAIL_COLUMN` | `cs_email` | CS email column; either email can match. |
 | `D1_STATUS_COLUMN` | Empty | Optional eligibility column. |
 | `D1_STATUS_VALUE` | `active` | Required value when a status column is configured. |
 | `MESSAGE_FILE` | `messages/verification.txt` | Verification request and reminder text. |

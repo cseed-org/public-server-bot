@@ -33,11 +33,14 @@ class D1:
     async def matches(self, name, email=None):
         c = self.config
         # Values are bound parameters. Only vetted administrator identifiers enter SQL.
-        where = f"lower(trim({identifier(c.name_column)})) = lower(trim(?))"
+        full_name = (f"trim({identifier(c.first_name_column)}) || ' ' || "
+                     f"trim({identifier(c.last_name_column)})")
+        where = f"lower({full_name}) = lower(trim(?))"
         params = [name.strip()]
         if email is not None:
-            where += f" AND lower(trim({identifier(c.email_column)})) = lower(trim(?))"
-            params.append(email.strip())
+            where += (f" AND (lower(trim({identifier(c.uw_email_column)})) = lower(trim(?))"
+                      f" OR lower(trim({identifier(c.cs_email_column)})) = lower(trim(?)))")
+            params.extend([email.strip(), email.strip()])
         if c.status_column:
             where += f" AND {identifier(c.status_column)} = ?"
             params.append(c.status_value)

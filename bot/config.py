@@ -23,8 +23,10 @@ class Config:
     gemini_key: str
     model: str
     table: str
-    name_column: str
-    email_column: str
+    first_name_column: str
+    last_name_column: str
+    uw_email_column: str
+    cs_email_column: str
     status_column: str
     status_value: str
     message_file: Path
@@ -60,8 +62,12 @@ class Config:
             int(required("DISCORD_MEMBER_ROLE_ID")), required("CLOUDFLARE_ACCOUNT_ID"),
             required("CLOUDFLARE_D1_DATABASE_ID"), required("CLOUDFLARE_API_TOKEN"),
             required("GEMINI_API_KEY"), required("GEMINI_MODEL"),
-            os.getenv("D1_TABLE", "members"), os.getenv("D1_NAME_COLUMN", "full_name"),
-            os.getenv("D1_EMAIL_COLUMN", "email"), os.getenv("D1_STATUS_COLUMN", ""),
+            os.getenv("D1_TABLE", "People"),
+            os.getenv("D1_FIRST_NAME_COLUMN", "first_name"),
+            os.getenv("D1_LAST_NAME_COLUMN", "last_name"),
+            os.getenv("D1_UW_EMAIL_COLUMN", "uw_email"),
+            os.getenv("D1_CS_EMAIL_COLUMN", "cs_email"),
+            os.getenv("D1_STATUS_COLUMN", ""),
             os.getenv("D1_STATUS_VALUE", "active"),
             Path(os.getenv("MESSAGE_FILE", "messages/verification.txt")),
             Path(os.getenv("STATE_DB", "data/state.sqlite3")),
@@ -73,7 +79,8 @@ class Config:
             bounded_integer("MAX_CONCURRENT_API", "2", 16),
             bounded_integer("MAX_API_PER_MINUTE", "60", 600),
         )
-        for value in (config.table, config.name_column, config.email_column):
+        for value in (config.table, config.first_name_column, config.last_name_column,
+                      config.uw_email_column, config.cs_email_column):
             identifier(value)
         if config.status_column:
             identifier(config.status_column)
