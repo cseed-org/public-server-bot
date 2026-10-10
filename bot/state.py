@@ -13,6 +13,10 @@ class State:
             user_id TEXT PRIMARY KEY, opted_out INTEGER NOT NULL DEFAULT 0,
             next_reminder REAL NOT NULL DEFAULT 0, next_reply REAL NOT NULL DEFAULT 0
         )""")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(users)")}
+        for column in ("next_check", "next_command"):
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE users ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
         self.db.commit()
 
     def get(self, user_id):
@@ -22,8 +26,14 @@ class State:
         ).fetchone()
         return row or (0, 0, 0)
 
+    def deadline(self, user_id, field):
+        if field not in {"next_check", "next_command"}:
+            raise ValueError("Invalid deadline field")
+        row = self.db.execute(f"SELECT {field} FROM users WHERE user_id=?", (str(user_id),)).fetchone()
+        return row[0] if row else 0
+
     def update(self, user_id, **values):
-        if not values.keys() <= {"opted_out", "next_reminder", "next_reply"}:
+        if not values.keys() <= {"opted_out", "next_reminder", "next_reply", "next_check", "next_command"}:
             raise ValueError("Invalid state field")
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (str(user_id),))

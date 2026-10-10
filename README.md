@@ -7,6 +7,8 @@ A Dockerized Python bot for one Discord server. It checks new members, name chan
 
 Matching trims surrounding spaces and ignores ASCII case using SQLite `lower`. It does not use fuzzy matching or remove accents. Duplicate matches fail closed. A name match is the requested trust policy, **not proof of identity**; anyone who knows a listed name can use it. Email ownership is not verified either.
 
+See [the security review](SECURITY_REVIEW.md) for safeguards, accepted risks, and validation results. Do not use this matching policy to protect sensitive information or privileged operations.
+
 ## Prerequisites
 
 - A Discord server where you can install a bot and manage roles.
@@ -50,7 +52,7 @@ Use `KEY=value` entries in `.env`. Replace the blank credentials and IDs using t
 2. Open the application's **Bot** page. Generate or reset its bot token, copy it, and set `DISCORD_TOKEN` in `.env`. Use the bot token, not the application ID or client secret.
 3. Under **Privileged Gateway Intents**, enable **Server Members Intent** and save. The bot needs member events and the member list. Message Content Intent is unnecessary for its direct-message workflow. See the [discord.py intent guide](https://discordpy.readthedocs.io/en/latest/intents.html).
 4. Configure a **Guild Install** with the `bot` scope and **Manage Roles** permission, then open the generated installation link and select your server. Discord's [installation walkthrough](https://docs.discord.com/developers/quick-start/getting-started) explains the portal flow.
-5. In your server settings, create or choose the role verified members should receive. Use a normal role, not `@everyone` or an integration-managed role. Move the bot's role **above** that members role and ensure the bot has **Manage Roles**.
+5. In your server settings, create or choose the role verified members should receive. Use a normal role, not `@everyone` or an integration-managed role. Move the bot's role **above** that members role and ensure the bot has **Manage Roles**. The bot rejects target roles with administrative or moderation permissions, audit-log access, or mass mentions. Review channel permission overrides separately; give the bot only the permissions it needs.
 6. In Discord's user settings, enable **Advanced > Developer Mode**. Right-click your server and copy its server ID into `DISCORD_GUILD_ID`. Copy the target role's ID from the server's role settings into `DISCORD_MEMBER_ROLE_ID`. Both values must be numeric IDs, not names.
 
 The bot handles one configured server and assigns the selected role. It does not create roles or configure the channels that role can access.
@@ -128,8 +130,9 @@ Optional settings and their defaults:
 | `STATE_DB` | `data/state.sqlite3` | Local SQLite state, separate from D1. |
 | `SCAN_INTERVAL_SECONDS` | `900` | Seconds between scans of server members. |
 | `REMINDER_INTERVAL_HOURS` | `24` | Minimum hours between scheduled reminder attempts. |
-| `DM_COOLDOWN_SECONDS` | `60` | Minimum seconds between a user's verification replies being processed. |
-| `MAX_CONCURRENT_API` | `2` | Maximum simultaneous D1/Gemini workflows; integer from 1 to 16. |
+| `DM_COOLDOWN_SECONDS` | `60` | Separate per-user cooldowns for verification replies, automatic name checks, and command acknowledgments. |
+| `MAX_CONCURRENT_API` | `2` | Maximum simultaneous workflows, including API calls and Discord replies; integer from 1 to 16. |
+| `MAX_API_PER_MINUTE` | `60` | Shared rolling limit on name-check and DM verification workflows; integer from 1 to 600. |
 | `BOT_CPUS` | `0.5` | Docker CPU limit, measured in CPU cores. |
 | `BOT_MEMORY_LIMIT` | `256m` | Docker RAM limit; container swap is disabled. |
 
@@ -168,7 +171,13 @@ The bot scans every 15 minutes by default, including after startup. Joins, name 
 
 `STOP`, `unsubscribe`, `not interested`, `no thanks`, and common opt-out phrases permanently disable reminders. `START` explicitly resumes them. These commands run locally without Gemini. Opt-out does not disable automatic name-based role assignment. Custom opt-out wording beyond recognized phrases should use STOP. Opt-outs, reminder deadlines, and reply rate limits persist in the `bot-state` Docker volume, including after leaving/rejoining. Do not delete this volume (`docker compose down -v`) unless you intend to erase preferences. Run exactly **one replica** per server using this state volume.
 
-DM parsing is rate-limited per user (default 60 seconds), with up to two concurrent API workflows by default. Invalid, missing, or ambiguous details produce a generic failure without revealing whether a name/email exists. An administrator should monitor logs for configuration/API errors; logs record error types without message contents or API response bodies. Large servers may need a longer scan interval and an indexed membership schema to control D1 cost.
+DM parsing and automatic name checks have separate persistent per-user cooldowns (default 60 seconds). `START` never resets a verification cooldown. Command acknowledgments are also throttled; `STOP` still records the opt-out immediately during overload for cached, eligible server members. An immediate `START` can resume reminders without another acknowledgment during the command cooldown.
+
+At most two workflows run concurrently by default, each with a 60-second deadline. Duplicate events and work arriving at capacity are dropped; retry a DM later, while member checks retry on a later scan. Uncached users and users outside the configured server are ignored before any REST calls, replies, or state writes. The background scan loads the member cache after connection.
+
+Name checks and DM verification share a default budget of 60 workflows per rolling minute. A name workflow performs at most three D1 queries; a DM workflow performs at most one Gemini call and one D1 query. This budget resets on process restart; per-user cooldowns persist. Scans pause when the budget is exhausted so later members can still be checked. Rate limits constrain abuse but are not a daily spending cap; configure provider quotas as well.
+
+Invalid, missing, or ambiguous details produce a generic failure without revealing whether a name/email exists. An administrator should monitor logs for configuration/API errors; logs record error types without message contents or API response bodies. Large servers may need a longer scan interval and an indexed membership schema to control D1 cost. Membership, screening, target-role permissions, and the matched Discord name (for name-based checks) are checked again immediately before granting the role.
 
 ## Resource usage
 

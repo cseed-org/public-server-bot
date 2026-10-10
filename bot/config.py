@@ -35,6 +35,7 @@ class Config:
     error_message_file: Path = Path("messages/error.txt")
     failure_message_file: Path = Path("messages/verification_failed.txt")
     max_concurrent_api: int = 2
+    max_api_per_minute: int = 60
 
     @classmethod
     def load(cls):
@@ -70,6 +71,7 @@ class Config:
             Path(os.getenv("ERROR_MESSAGE_FILE", "messages/error.txt")),
             Path(os.getenv("FAILURE_MESSAGE_FILE", "messages/verification_failed.txt")),
             bounded_integer("MAX_CONCURRENT_API", "2", 16),
+            bounded_integer("MAX_API_PER_MINUTE", "60", 600),
         )
         for value in (config.table, config.name_column, config.email_column):
             identifier(value)

@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+from collections import deque
+from contextlib import asynccontextmanager
 from weakref import WeakValueDictionary
 
 import discord
@@ -26,6 +28,27 @@ class VerificationBot(discord.Client):
         # Active holders and waiters keep their lock alive; idle users consume no lock storage.
         self.locks = WeakValueDictionary()
         self.api_slots = asyncio.Semaphore(config.max_concurrent_api)
+        self.api_starts = deque()
+
+    @asynccontextmanager
+    async def work_slot(self, user_id):
+        lock = self.member_lock(user_id)
+        # No waiting tasks: duplicate events and overload are retried by a later
+        # scan or DM. Neither acquire suspends when its primitive is available.
+        if lock.locked() or self.api_slots.locked():
+            yield False
+            return
+        async with lock, self.api_slots, asyncio.timeout(60):
+            yield True
+
+    def reserve_api_budget(self):
+        now = time.monotonic()
+        while self.api_starts and self.api_starts[0] <= now - 60:
+            self.api_starts.popleft()
+        if len(self.api_starts) >= self.config.max_api_per_minute:
+            return False
+        self.api_starts.append(now)
+        return True
 
     def member_lock(self, user_id):
         lock = self.locks.get(user_id)
@@ -49,27 +72,48 @@ class VerificationBot(discord.Client):
         me = guild.me
         if not role or role.is_default() or role.managed or not me or not me.guild_permissions.manage_roles or role >= me.top_role:
             raise RuntimeError("Configure a members role below the bot's role and grant Manage Roles")
+        dangerous = (
+            "administrator", "manage_guild", "manage_roles", "manage_channels",
+            "manage_webhooks", "kick_members", "ban_members", "moderate_members",
+            "manage_messages", "manage_threads", "mention_everyone",
+            "manage_nicknames", "manage_expressions", "manage_events",
+            "mute_members", "deafen_members", "move_members", "view_audit_log",
+        )
+        if any(getattr(role.permissions, permission) for permission in dangerous):
+            raise RuntimeError("The members role must not grant administrative or moderation permissions")
         return role
 
     def eligible(self, member):
         return member.guild.id == self.config.guild_id and not member.bot and not member.pending
 
-    async def grant(self, member, role):
+    async def grant(self, member, role, matched_name=None):
+        # A member may leave, resume screening, or change names during API calls.
+        member = await member.guild.fetch_member(member.id)
+        role = self.role(member.guild)
+        if not self.eligible(member) or role in member.roles:
+            return False
+        if matched_name is not None and matched_name not in (member.nick, member.global_name, member.name):
+            return False
         await member.add_roles(role, reason="Membership matched in D1")
         log.info("Membership role granted")
+        return True
 
     async def check_member(self, member):
         if not self.eligible(member):
             return
-        async with self.member_lock(member.id):
+        async with self.work_slot(member.id) as admitted:
+            if not admitted:
+                return
             role = self.role(member.guild)
             if role in member.roles:
                 return
-            async with self.api_slots:
-                for name in dict.fromkeys(n for n in (member.nick, member.global_name, member.name) if n):
-                    if await self.d1.matches(name):
-                        await self.grant(member, role)
-                        return
+            if time.time() < self.state.deadline(member.id, "next_check") or not self.reserve_api_budget():
+                return
+            self.state.update(member.id, next_check=time.time() + self.config.cooldown_seconds)
+            for name in dict.fromkeys(n for n in (member.nick, member.global_name, member.name) if n):
+                if await self.d1.matches(name):
+                    await self.grant(member, role, matched_name=name)
+                    return
             stopped, next_reminder, _ = self.state.get(member.id)
             if stopped or time.time() < next_reminder:
                 return
@@ -99,6 +143,10 @@ class VerificationBot(discord.Client):
             if not guild.chunked:
                 await guild.chunk(cache=True)
             for member in guild.members:
+                # Pace the single background scan so later members are not
+                # permanently starved by the shared rolling request budget.
+                if len(self.api_starts) >= self.config.max_api_per_minute:
+                    await asyncio.sleep(max(0, self.api_starts[0] + 60 - time.monotonic()))
                 await self.safe_check(member)
         except Exception as exc:
             log.error("Scan failed (%s): check guild permissions and configuration", type(exc).__name__)
@@ -129,27 +177,47 @@ class VerificationBot(discord.Client):
         except Exception as exc:
             log.warning("DM handling failed (%s)", type(exc).__name__)
             try:
-                await message.channel.send(self.config.message("error"))
-            except (discord.HTTPException, OSError, ValueError):
+                async with self.work_slot(message.author.id) as admitted:
+                    if admitted:
+                        await message.channel.send(self.config.message("error"))
+            except (discord.HTTPException, OSError, ValueError, TimeoutError):
                 log.warning("Could not deliver error message")
 
     async def handle_dm(self, message):
         user_id = message.author.id
         text = message.content.strip()
-        async with self.member_lock(user_id):
-            if opted_out(text):
-                self.state.update(user_id, opted_out=1)
-                await message.channel.send("Reminders stopped. I won't DM you again unless you send START.")
+        guild = self.get_guild(self.config.guild_id)
+        member = guild.get_member(user_id) if guild else None
+        # Reject outsiders before writes, replies, or Discord REST requests.
+        if not member or not self.eligible(member):
+            return
+        stop = opted_out(text)
+        # STOP takes effect even while a verification is in flight or at capacity.
+        if stop and not self.state.get(user_id)[0]:
+            self.state.update(user_id, opted_out=1)
+        async with self.work_slot(user_id) as admitted:
+            if not admitted:
                 return
             stopped, _, next_reply = self.state.get(user_id)
-            if normalized(text) == "start":
-                self.state.update(user_id, opted_out=0, next_reminder=time.time() + self.config.reminder_seconds, next_reply=0)
-                await message.channel.send(self.config.message())
+            if stop or normalized(text) == "start":
+                if not stop and stopped:
+                    self.state.update(user_id, opted_out=0)
+                if time.time() < self.state.deadline(user_id, "next_command"):
+                    return
+                self.state.update(user_id, next_command=time.time() + self.config.cooldown_seconds)
+                if stop:
+                    await message.channel.send("Reminders stopped. I won't DM you again unless you send START.")
+                else:
+                    self.state.update(user_id, opted_out=0, next_reminder=time.time() + self.config.reminder_seconds)
+                    await message.channel.send(self.config.message())
                 return
-            if stopped:
+            if stopped or time.time() < next_reply:
                 return
-            guild = self.get_guild(self.config.guild_id)
-            if not guild:
+            if not self.reserve_api_budget():
+                return
+            self.state.update(user_id, next_reply=time.time() + self.config.cooldown_seconds)
+            role = self.role(guild)
+            if role in member.roles:
                 return
             try:
                 member = await guild.fetch_member(user_id)
@@ -160,18 +228,14 @@ class VerificationBot(discord.Client):
             role = self.role(guild)
             if role in member.roles:
                 return
-            if time.time() < next_reply:
-                return
-            self.state.update(user_id, next_reply=time.time() + self.config.cooldown_seconds)
             if not text or len(text) > 2000:
                 await message.channel.send("Please send your full name and email together as text, at most 2000 characters. Reply STOP to end reminders.")
                 return
-            async with self.api_slots:
-                parsed = await self.parser.parse(text)
-                if parsed and await self.d1.matches(*parsed):
-                    await self.grant(member, role)
+            parsed = await self.parser.parse(text)
+            if parsed and await self.d1.matches(*parsed):
+                if await self.grant(member, role):
                     await message.channel.send("You're verified! The members role has been added.")
-                    return
+                return
             await message.channel.send(self.config.message("failure"))
 
     async def on_error(self, event_method, *args, **kwargs):
