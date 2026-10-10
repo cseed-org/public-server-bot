@@ -14,7 +14,7 @@ import httpx
 from bot.config import Config, identifier
 from bot.services import D1, Parser, ServiceError, opted_out
 from bot.state import State
-from bot.__main__ import VerificationBot
+from bot.__main__ import VerificationBot, error_summary
 
 
 class ServicesTest(unittest.IsolatedAsyncioTestCase):
@@ -137,6 +137,13 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.scan_seconds, 1800)
         self.assertEqual(config.max_concurrent_api, 1)
 
+    def test_reminders_cannot_be_configured_more_than_daily(self):
+        self.assertEqual(self.load().reminder_seconds, 86400)
+        self.assertEqual(self.load(REMINDER_INTERVAL_HOURS="48").reminder_seconds, 172800)
+        for value in ("0", "-1", "1", "23.99", "nan", "inf"):
+            with self.subTest(interval=value), self.assertRaises(ValueError):
+                self.load(REMINDER_INTERVAL_HOURS=value)
+
     def test_invalid_resource_settings_fail_at_startup(self):
         for value in ("0", "-1", "17", "1.5", "nan", ""):
             with self.subTest(concurrency=value), self.assertRaises(ValueError):
@@ -150,6 +157,22 @@ class ConfigTest(unittest.TestCase):
 
 
 class StateTest(unittest.TestCase):
+    def test_reminder_reservation_is_shared_and_enforces_daily_minimum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            first, second = State(path), State(path)
+            try:
+                self.assertTrue(first.reserve_reminder(123, 1000, 60))
+                self.assertFalse(second.reserve_reminder(123, 1000, 60))
+                self.assertFalse(second.reserve_reminder(123, 87399, 60))
+                self.assertTrue(second.reserve_reminder(123, 87400, 60))
+                self.assertTrue(first.reserve_reminder(456, 1000, 86400))
+                first.update(789, opted_out=1)
+                self.assertFalse(second.reserve_reminder(789, 1000, 86400))
+            finally:
+                first.close()
+                second.close()
+
     def test_existing_database_migration_preserves_preferences_and_limits(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.db"
@@ -207,9 +230,78 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         await self.bot.check_member(self.member)
         await self.bot.check_member(self.member)
         self.member.send.assert_awaited_once()
-        self.bot.state.update(3, opted_out=1, next_reminder=0)
+        self.bot.state.update(3, opted_out=1, next_reminder=0, next_check=0)
+        self.bot.state.close()
+        self.bot.state = State(self.config.state_file)
         await self.bot.check_member(self.member)
         self.member.send.assert_awaited_once()
+
+    async def test_reminder_boundary_survives_restart_and_name_changes(self):
+        with patch("bot.__main__.time.time", return_value=1000) as now:
+            await self.bot.check_member(self.member)
+            self.bot.state.close()
+            self.bot.state = State(self.config.state_file)
+            self.member.nick = "Changed Name"
+            now.return_value = 1000 + 86399
+            await self.bot.check_member(self.member)
+            self.member.send.assert_awaited_once()
+            # Clear only the API cooldown so it cannot mask the reminder boundary.
+            self.bot.state.update(3, next_check=0)
+            now.return_value = 1000 + 86400
+            await self.bot.check_member(self.member)
+            self.assertEqual(self.member.send.await_count, 2)
+
+    async def test_failed_reminder_is_not_retried_before_next_day(self):
+        self.member.send.side_effect = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden"),
+            {"code": 50007, "message": "Cannot send messages to this user"},
+        )
+        with patch("bot.__main__.time.time", return_value=1000) as now:
+            await self.bot.check_member(self.member)
+            self.bot.state.close()
+            self.bot.state = State(self.config.state_file)
+            now.return_value = 87400 - 61
+            await self.bot.check_member(self.member)
+            self.member.send.assert_awaited_once()
+            now.return_value = 87400
+            await self.bot.check_member(self.member)
+            self.assertEqual(self.member.send.await_count, 2)
+
+    async def test_stop_during_name_lookup_prevents_reminder(self):
+        async def matches(name):
+            self.bot.state.update(3, opted_out=1)
+            return False
+
+        self.bot.d1.matches.side_effect = matches
+        await self.bot.check_member(self.member)
+        self.member.send.assert_not_awaited()
+
+    async def test_daily_reminder_does_not_block_requested_verification_reply(self):
+        await self.bot.check_member(self.member)
+        self.bot.d1.matches.return_value = True
+        msg = SimpleNamespace(author=SimpleNamespace(id=3), content="Jane Doe jane@example.com",
+                              channel=SimpleNamespace(send=AsyncMock()))
+        await self.bot.handle_dm(msg)
+        self.member.add_roles.assert_awaited_once()
+        msg.channel.send.assert_awaited_once_with("You're verified! The members role has been added.")
+
+    async def test_dm_http_error_logs_service_and_status_without_secrets(self):
+        request = httpx.Request("POST", "https://generativelanguage.googleapis.com/private?key=secret",
+                                content="private member details")
+        response = httpx.Response(429, request=request, text="sensitive response")
+        error = httpx.HTTPStatusError("sensitive exception", request=request, response=response)
+        self.bot.handle_dm = AsyncMock(side_effect=error)
+        channel = MagicMock(spec=discord.DMChannel)
+        channel.send = AsyncMock()
+        msg = SimpleNamespace(author=SimpleNamespace(id=3, bot=False), channel=channel)
+        with self.assertLogs("verification", level="WARNING") as logs:
+            await self.bot.on_message(msg)
+        self.assertEqual(logs.output, ["WARNING:verification:DM handling failed (Gemini HTTP 429)"])
+        channel.send.assert_awaited_once()
+        request = httpx.Request("POST", "https://api.cloudflare.com/private")
+        response = httpx.Response(403, request=request)
+        error = httpx.HTTPStatusError("secret", request=request, response=response)
+        self.assertEqual(error_summary(error), "Cloudflare D1 HTTP 403")
 
     async def test_matching_name_grants_role_without_ai_or_dm(self):
         self.bot.d1.matches.return_value = True

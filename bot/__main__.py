@@ -16,6 +16,17 @@ from .state import State
 log = logging.getLogger("verification")
 
 
+def error_summary(exc):
+    # Only fixed service labels and status codes; never URLs or response bodies.
+    if isinstance(exc, httpx.HTTPStatusError):
+        service = {
+            "api.cloudflare.com": "Cloudflare D1",
+            "generativelanguage.googleapis.com": "Gemini",
+        }.get(exc.request.url.host, "External API")
+        return f"{service} HTTP {exc.response.status_code}"
+    return type(exc).__name__
+
+
 class VerificationBot(discord.Client):
     def __init__(self, config):
         intents = discord.Intents.none()
@@ -119,18 +130,20 @@ class VerificationBot(discord.Client):
                 return
             message = self.config.message()
             # Reserve before sending: crashes and closed DMs cannot cause repeated attempts.
-            self.state.update(member.id, next_reminder=time.time() + self.config.reminder_seconds)
+            if not self.state.reserve_reminder(member.id, time.time(), self.config.reminder_seconds):
+                return
             try:
                 await member.send(message)
-            except discord.HTTPException:
-                log.warning("Reminder delivery failed; retry at next daily interval")
+            except discord.HTTPException as exc:
+                log.warning("Reminder delivery failed (Discord HTTP %s, code %s); retry at next daily interval",
+                            exc.status, exc.code)
 
     async def safe_check(self, member):
         try:
             await self.check_member(member)
         except Exception as exc:
             # Never log API response bodies, tokens, SQL parameters or message text.
-            log.warning("Member check failed (%s)", type(exc).__name__)
+            log.warning("Member check failed (%s)", error_summary(exc))
 
     @tasks.loop(seconds=900)
     async def scan(self):
@@ -175,7 +188,7 @@ class VerificationBot(discord.Client):
         try:
             await self.handle_dm(message)
         except Exception as exc:
-            log.warning("DM handling failed (%s)", type(exc).__name__)
+            log.warning("DM handling failed (%s)", error_summary(exc))
             try:
                 async with self.work_slot(message.author.id) as admitted:
                     if admitted:

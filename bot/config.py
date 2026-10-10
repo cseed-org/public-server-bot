@@ -79,6 +79,8 @@ class Config:
             bounded_integer("MAX_CONCURRENT_API", "2", 16),
             bounded_integer("MAX_API_PER_MINUTE", "60", 600),
         )
+        if config.reminder_seconds < 86400:
+            raise ValueError("REMINDER_INTERVAL_HOURS must be at least 24")
         for value in (config.table, config.first_name_column, config.last_name_column,
                       config.uw_email_column, config.cs_email_column):
             identifier(value)

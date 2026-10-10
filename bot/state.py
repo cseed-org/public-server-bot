@@ -40,5 +40,16 @@ class State:
             for key, value in values.items():
                 self.db.execute(f"UPDATE users SET {key}=? WHERE user_id=?", (value, str(user_id)))
 
+    def reserve_reminder(self, user_id, now, interval):
+        """Commit the daily attempt before sending, including across connections."""
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (str(user_id),))
+            result = self.db.execute(
+                "UPDATE users SET next_reminder=? "
+                "WHERE user_id=? AND opted_out=0 AND next_reminder<=?",
+                (now + max(86400, interval), str(user_id), now),
+            )
+        return result.rowcount == 1
+
     def close(self):
         self.db.close()

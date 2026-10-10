@@ -133,7 +133,7 @@ Optional settings and their defaults:
 | `FAILURE_MESSAGE_FILE` | `messages/verification_failed.txt` | Unsuccessful-verification text. |
 | `STATE_DB` | `data/state.sqlite3` | Local SQLite state, separate from D1. |
 | `SCAN_INTERVAL_SECONDS` | `900` | Seconds between scans of server members. |
-| `REMINDER_INTERVAL_HOURS` | `24` | Minimum hours between scheduled reminder attempts. |
+| `REMINDER_INTERVAL_HOURS` | `24` | Hours between automatic reminder attempts; values below 24 are rejected. |
 | `DM_COOLDOWN_SECONDS` | `60` | Separate per-user cooldowns for verification replies, automatic name checks, and command acknowledgments. |
 | `MAX_CONCURRENT_API` | `2` | Maximum simultaneous workflows, including API calls and Discord replies; integer from 1 to 16. |
 | `MAX_API_PER_MINUTE` | `60` | Shared rolling limit on name-check and DM verification workflows; integer from 1 to 600. |
@@ -175,6 +175,8 @@ The bot scans every 15 minutes by default, including after startup. Joins, name 
 
 `STOP`, `unsubscribe`, `not interested`, `no thanks`, and common opt-out phrases permanently disable reminders. `START` explicitly resumes them. These commands run locally without Gemini. Opt-out does not disable automatic name-based role assignment. Custom opt-out wording beyond recognized phrases should use STOP. Opt-outs, reminder deadlines, and reply rate limits persist in the `bot-state` Docker volume, including after leaving/rejoining. Do not delete this volume (`docker compose down -v`) unless you intend to erase preferences. Run exactly **one replica** per server using this state volume.
 
+Automatic reminders have a persistent, per-person minimum interval of 24 hours, including failed delivery attempts. The deadline is committed before sending, so restarts and overlapping checks using the same state database cannot bypass it. This is a rolling 24-hour interval, not a reset at midnight. Replies to user messages (verification results, errors, and `STOP`/`START` acknowledgments) are separate from automatic reminders and can be sent sooner.
+
 DM parsing and automatic name checks have separate persistent per-user cooldowns (default 60 seconds). `START` never resets a verification cooldown. Command acknowledgments are also throttled; `STOP` still records the opt-out immediately during overload for cached, eligible server members. An immediate `START` can resume reminders without another acknowledgment during the command cooldown.
 
 At most two workflows run concurrently by default, each with a 60-second deadline. Duplicate events and work arriving at capacity are dropped; retry a DM later, while member checks retry on a later scan. Uncached users and users outside the configured server are ignored before any REST calls, replies, or state writes. The background scan loads the member cache after connection.
@@ -205,7 +207,7 @@ BOT_CPUS=0.5
 BOT_MEMORY_LIMIT=256m
 ```
 
-Rebuild and recreate with `docker compose up -d --build --force-recreate bot`. To reduce background activity further, use `SCAN_INTERVAL_SECONDS=1800` and `MAX_CONCURRENT_API=1`; full scans and bursts of DM verification will take longer. Keep the daily reminder interval unless you intentionally want a different reminder schedule.
+Rebuild and recreate with `docker compose up -d --build --force-recreate bot`. To reduce background activity further, use `SCAN_INTERVAL_SECONDS=1800` and `MAX_CONCURRENT_API=1`; full scans and bursts of DM verification will take longer. You can increase the reminder interval above 24 hours to send reminders less often.
 
 Measure actual usage with `docker compose stats bot` after startup and during a scan. A container that exceeds its RAM limit can be killed and restarted; check `docker compose ps -a` and logs if it repeatedly restarts, and raise `BOT_MEMORY_LIMIT` if your server needs more memory. Resource usage depends on member count and message traffic.
 
@@ -249,7 +251,8 @@ Tests use fake Discord members and mock HTTP services; they do not contact your 
 | Discord login or privileged-intent failure | Check the bot token and enable Server Members Intent in the Developer Portal. |
 | `Configured guild unavailable` | Confirm the server ID and that the bot has been invited to that server. |
 | `Scan failed (RuntimeError)` or a role assignment fails | Check the target role ID, Manage Roles permission, and that the bot's highest role is above the target. The target must be a normal assignable role. |
-| `Member check failed (HTTPStatusError)` | Check the Cloudflare account/database IDs, token permissions, API availability, and quota. |
+| `Member check failed (Cloudflare D1 HTTP ...)` | Check the Cloudflare account/database IDs, token permissions, API availability, and quota. |
+| `DM handling failed (Gemini HTTP ...)` or `(Cloudflare D1 HTTP ...)` | The service and HTTP status identify the failing request. Check that service's credentials, configuration, and quota. URLs, credentials, message text, and response bodies are not logged. |
 | DM verification returns a temporary error | Check both D1 and Gemini credentials, the model ID, service quotas, and schema configuration. Logs intentionally omit API response bodies. |
 | A known member does not match | Check spelling, the configured columns and status filter, and duplicate eligible records. Matching is not fuzzy and does not remove accents. |
 | A DM reply is ignored | Check the reply cooldown, whether the user sent `STOP`, whether they already have the role, and whether they completed membership screening. Send `START` to clear an opt-out. |
