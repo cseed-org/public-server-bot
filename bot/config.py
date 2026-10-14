@@ -1,3 +1,4 @@
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -81,8 +82,11 @@ class Config:
             bounded_integer("MAX_API_PER_MINUTE", "60", 600),
             Path(os.getenv("MEMBERSHIP_CACHE_DB", "data/members.sqlite3")),
         )
-        if config.reminder_seconds < 86400:
-            raise ValueError("REMINDER_INTERVAL_HOURS must be at least 24")
+        for key, value in (("DISCORD_GUILD_ID", config.guild_id), ("DISCORD_MEMBER_ROLE_ID", config.role_id)):
+            if not 0 < value < 2 ** 64:
+                raise ValueError(f"{key} must be a positive 64-bit Discord ID")
+        if not math.isfinite(config.reminder_seconds) or config.reminder_seconds < 86400:
+            raise ValueError("REMINDER_INTERVAL_HOURS must be at least 24 and finite in seconds")
         for value in (config.table, config.first_name_column, config.last_name_column,
                       config.uw_email_column, config.cs_email_column):
             identifier(value)

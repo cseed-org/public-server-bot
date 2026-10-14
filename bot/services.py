@@ -98,17 +98,22 @@ class Parser:
                     "Copy exact substrings; do not infer, translate, correct, or invent. "
                     "Return null for missing or ambiguous fields."}]},
                 "contents": [{"role": "user", "parts": [{"text": reply}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 512,
-                    "responseFormat": {"text": {"mimeType": "application/json", "schema": schema}}},
+                # responseFormat uses a MIME enum, unlike the legacy responseMimeType string.
+                # Leave sampling defaults intact for Gemini 3.6+ compatibility.
+                "generationConfig": {"maxOutputTokens": 512,
+                    "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": schema}}},
             },
         )
         response.raise_for_status()
         try:
             candidate = response.json()["candidates"][0]
-            if candidate.get("finishReason") != "STOP":
+            if not isinstance(candidate, dict) or candidate.get("finishReason") != "STOP":
                 raise ValueError("Incomplete extraction")
-            data = json.loads("".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")))
-            if set(data) != {"full_name", "email"}:
+            parts = candidate["content"]["parts"]
+            if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
+                raise ValueError("Invalid content parts")
+            data = json.loads("".join(p.get("text", "") for p in parts if not p.get("thought")))
+            if not isinstance(data, dict) or set(data) != {"full_name", "email"}:
                 raise ValueError("Unexpected fields")
             name, email = data["full_name"], data["email"]
             if not isinstance(name, str) or not isinstance(email, str):
@@ -116,8 +121,11 @@ class Parser:
             name, email = name.strip(), email.strip()
             if not 2 <= len(name) <= 200 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
                 return None
-            # Ground extraction in the actual reply before searching the cache.
-            if normalized(name) not in normalized(reply) or normalized(email) not in normalized(reply):
+            # Do not accept a name/address cut out of a longer identity token.
+            name_pattern = r"(?<!\w)" + re.escape(normalized(name)) + r"(?!\w)"
+            email_pattern = (r"(?<![\w.!#$%&'*+/=?^`{|}~@-])" + re.escape(normalized(email))
+                             + r"(?![\w@-]|\.[\w-])")
+            if not re.search(name_pattern, normalized(reply)) or not re.search(email_pattern, normalized(reply)):
                 return None
             return name, email
         except (KeyError, IndexError, TypeError, ValueError) as exc:

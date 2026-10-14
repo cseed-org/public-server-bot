@@ -110,13 +110,23 @@ class VerificationBot(discord.Client):
     def eligible(self, member):
         return member.guild.id == self.config.guild_id and not member.bot and not member.pending
 
-    async def grant(self, member, role, matched_name=None):
+    async def grant(self, member, role, matched_name=None, matched_identity=None):
         # A member may leave, resume screening, or change names during API calls.
         member = await member.guild.fetch_member(member.id)
         role = self.role(member.guild)
         if not self.eligible(member) or role in member.roles:
             return False
         if matched_name is not None and matched_name not in (member.nick, member.global_name, member.name):
+            return False
+        # Fetching Discord membership yields to the cache refresher. Recheck the
+        # match and expiry after that fetch, immediately before assigning a role.
+        if matched_name is not None:
+            if not await self.d1.matches(matched_name):
+                return False
+        elif matched_identity is not None:
+            if not await self.d1.matches(*matched_identity):
+                return False
+        else:
             return False
         await member.add_roles(role, reason="Membership matched in cached D1 records")
         log.info("Membership role granted")
@@ -239,6 +249,8 @@ class VerificationBot(discord.Client):
                 return
             if stopped or time.time() < next_reply:
                 return
+            if any(role.id == self.config.role_id for role in member.roles):
+                return
             if not self.reserve_api_budget():
                 return
             self.state.update(user_id, next_reply=time.time() + self.config.cooldown_seconds)
@@ -259,7 +271,7 @@ class VerificationBot(discord.Client):
                 return
             parsed = await self.parser.parse(text)
             if parsed and await self.d1.matches(*parsed):
-                if await self.grant(member, role):
+                if await self.grant(member, role, matched_identity=parsed):
                     await message.channel.send("You're verified! The members role has been added.")
                 return
             await message.channel.send(self.config.message("failure"))

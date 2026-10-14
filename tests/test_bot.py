@@ -215,6 +215,53 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("authorization", seen[0].headers)
         self.assertFalse(hasattr(parser, "d1"))
 
+    async def test_parser_rejects_partial_identity_tokens(self):
+        output = {"full_name": "Jane Doe", "email": "jane@example.com"}
+        def handler(request):
+            return httpx.Response(200, json={"candidates": [{"finishReason": "STOP",
+                "content": {"parts": [{"text": json.dumps(output)}]}}]})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            parser = Parser("ai-key", "test-model", client)
+            for reply in ("Jane Doe notjane@example.com", "Jane Doe jane@example.com.au",
+                          "Jane Doe other+jane@example.com", "NotJane Doe jane@example.com"):
+                with self.subTest(reply=reply):
+                    self.assertIsNone(await parser.parse(reply))
+            for reply in ("I'm Jane Doe, email: jane@example.com.",
+                          "Jane Doe <jane@example.com>", "JANE DOE JANE@EXAMPLE.COM"):
+                with self.subTest(reply=reply):
+                    self.assertEqual(await parser.parse(reply), ("Jane Doe", "jane@example.com"))
+
+    async def test_parser_malformed_responses_are_service_errors(self):
+        bodies = [{"candidates": [None]}, {"candidates": ["invalid"]},
+                  {"candidates": [{"finishReason": "STOP", "content": {"parts": [None]}}]}]
+        for body in bodies:
+            with self.subTest(body=body):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(
+                        lambda request: httpx.Response(200, json=body))) as client:
+                    with self.assertRaises(ServiceError):
+                        await Parser("ai-key", "test-model", client).parse("Jane Doe jane@example.com")
+
+    async def test_parser_uses_generate_content_response_format_enum(self):
+        def handler(request):
+            config = json.loads(request.content)["generationConfig"]
+            # The REST API expects an enum here, not the legacy MIME string.
+            if config["responseFormat"]["text"]["mimeType"] != "APPLICATION_JSON":
+                return httpx.Response(400)
+            self.assertNotIn("temperature", config)
+            self.assertNotIn("topP", config)
+            self.assertNotIn("topK", config)
+            self.assertEqual(request.url.path, "/v1beta/models/gemini-3.8-flash:generateContent")
+            return httpx.Response(200, json={"candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": json.dumps({
+                    "full_name": "Jane Doe", "email": "jane@example.com",
+                })}]},
+            }]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            parser = Parser("ai-key", "gemini-3.8-flash", client)
+            self.assertEqual(await parser.parse("Jane Doe jane@example.com"),
+                             ("Jane Doe", "jane@example.com"))
+
 
 class ConfigTest(unittest.TestCase):
     def load(self, **overrides):
@@ -263,6 +310,16 @@ class ConfigTest(unittest.TestCase):
         for value in ("0", "601", "nan"):
             with self.subTest(budget=value), self.assertRaises(ValueError):
                 self.load(MAX_API_PER_MINUTE=value)
+
+    def test_reminder_conversion_cannot_overflow(self):
+        with self.assertRaises(ValueError):
+            self.load(REMINDER_INTERVAL_HOURS="1e308")
+
+    def test_discord_ids_must_be_positive_snowflakes(self):
+        for key in ("DISCORD_GUILD_ID", "DISCORD_MEMBER_ROLE_ID"):
+            for value in ("0", "-1", str(2 ** 64)):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    self.load(**{key: value})
 
 
 class CacheLifecycleTest(unittest.IsolatedAsyncioTestCase):
@@ -347,7 +404,7 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.config = SimpleNamespace(state_file=Path(self.tmp.name) / "state.db", guild_id=1, role_id=2, reminder_seconds=86400, cooldown_seconds=60, max_concurrent_api=2, max_api_per_minute=60, message=lambda kind="verification": "Verify. Reply STOP.")
         self.bot = VerificationBot(self.config)
-        self.role = object()
+        self.role = SimpleNamespace(id=2)
         self.bot.role = lambda guild: self.role
         self.bot.d1 = SimpleNamespace(matches=AsyncMock(return_value=False))
         self.bot.parser = SimpleNamespace(parse=AsyncMock(return_value=("Jane Doe", "jane@example.com")))
@@ -476,6 +533,47 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             setattr(self.member, attribute, original)
         self.member.send.assert_not_awaited()
         self.bot.d1.matches.assert_not_awaited()
+
+    async def test_verified_member_dm_preserves_budget_for_unverified_member(self):
+        self.config.max_api_per_minute = 1
+        self.member.roles = [self.role]
+        msg = SimpleNamespace(author=SimpleNamespace(id=3), content="Hello",
+                              channel=SimpleNamespace(send=AsyncMock()))
+        await self.bot.handle_dm(msg)
+        self.member.roles = []
+        self.bot.state.update(3, next_reply=0)
+        msg.content = "Jane Doe jane@example.com"
+        await self.bot.handle_dm(msg)
+        self.bot.parser.parse.assert_awaited_once()
+
+    async def test_name_match_removed_during_discord_fetch_cannot_grant(self):
+        self.bot.d1.matches.return_value = True
+
+        async def fetch(user_id):
+            self.bot.d1.matches.return_value = False
+            return self.member
+
+        self.guild.fetch_member.side_effect = fetch
+        await self.bot.check_member(self.member)
+        self.member.add_roles.assert_not_awaited()
+
+    async def test_dm_match_expired_during_final_discord_fetch_cannot_grant(self):
+        self.bot.d1.matches.return_value = True
+        fetches = 0
+
+        async def fetch(user_id):
+            nonlocal fetches
+            fetches += 1
+            if fetches == 2:
+                self.bot.d1.matches.side_effect = CacheUnavailable("Expired")
+            return self.member
+
+        self.guild.fetch_member.side_effect = fetch
+        msg = SimpleNamespace(author=SimpleNamespace(id=3), content="Jane Doe jane@example.com",
+                              channel=SimpleNamespace(send=AsyncMock()))
+        with self.assertRaises(CacheUnavailable):
+            await self.bot.handle_dm(msg)
+        self.member.add_roles.assert_not_awaited()
 
     async def test_concurrent_checks_share_lock_and_send_one_reminder(self):
         active = 0
