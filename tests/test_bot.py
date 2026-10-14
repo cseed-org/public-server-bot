@@ -215,6 +215,83 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("authorization", seen[0].headers)
         self.assertFalse(hasattr(parser, "d1"))
 
+    async def test_join_refresh_only_for_absent_names_and_coalesces_bursts(self):
+        records = [{"full_name": "Jane Doe", "uw_email": None, "cs_email": None}] * 2
+        calls = []
+
+        async def handler(request):
+            calls.append(request)
+            await asyncio.sleep(0)
+            return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": records}]})
+
+        cache = self.cache()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch("bot.services.time.time", return_value=1000) as now:
+                d1 = D1(self.d1_config(), client, cache)
+                await d1.refresh()
+                now.return_value += 60
+                # Duplicates cannot grant a role, but the name is present locally.
+                self.assertFalse(await d1.matches("Jane Doe"))
+                self.assertFalse(await d1.refresh(join_names=("unknown", " JANE DOE ")))
+                self.assertFalse(await d1.refresh(join_names=()))
+                self.assertEqual(len(calls), 1)
+                records.append({"full_name": "New Member", "uw_email": None, "cs_email": None})
+                await asyncio.gather(*(d1.refresh(join_names=("New Member",)) for _ in range(10)))
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(await d1.matches("New Member"))
+                self.assertFalse(await d1.refresh(join_names=("Other New Member",)))
+                self.assertFalse(await d1.refresh())
+                now.return_value += REFRESH_SECONDS
+                self.assertTrue(await d1.refresh())
+                self.assertEqual(len(calls), 3)
+
+    async def test_join_refresh_failure_and_deadlines_survive_restart(self):
+        cache = self.cache()
+        path = Path(cache.db.execute("PRAGMA database_list").fetchone()[2])
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if len(calls) > 1:
+                return httpx.Response(503)
+            return httpx.Response(200, json={"success": True, "result": [{"success": True, "results": []}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch("bot.services.time.time", return_value=1000) as now:
+                await D1(self.d1_config(), client, cache).refresh()
+                cache.close()
+                cache = MembershipCache(path)
+                self.addCleanup(cache.close)
+                d1 = D1(self.d1_config(), client, cache)
+                now.return_value += 59
+                self.assertFalse(await d1.refresh(join_names=("Unknown",)))
+                now.return_value += 1
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await d1.refresh(join_names=("Unknown",))
+                cache.close()
+                cache = MembershipCache(path)
+                self.addCleanup(cache.close)
+                d1 = D1(self.d1_config(), client, cache)
+                now.return_value += 60
+                self.assertFalse(await d1.refresh(join_names=("Another",)))
+                self.assertFalse(await d1.refresh())
+                self.assertEqual(len(calls), 2)
+
+    def test_old_cache_migration_preserves_refresh_gate_and_allows_join_misses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE refresh (id INTEGER PRIMARY KEY, next_attempt REAL, valid_until REAL)")
+            db.execute("INSERT INTO refresh VALUES (1, 22600, 22600)")
+            db.commit()
+            db.close()
+            cache = MembershipCache(path)
+            try:
+                self.assertFalse(cache.reserve_refresh(1060))
+                self.assertTrue(cache.reserve_refresh(1060, on_join=True))
+            finally:
+                cache.close()
+
     async def test_parser_rejects_partial_identity_tokens(self):
         output = {"full_name": "Jane Doe", "email": "jane@example.com"}
         def handler(request):
@@ -263,6 +340,93 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
                              ("Jane Doe", "jane@example.com"))
 
 
+class ParserFallbackTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.now = 1000
+        self.clock = patch("bot.services.time", SimpleNamespace(monotonic=lambda: self.now, time=lambda: 1000))
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+
+        async def sleep(seconds):
+            self.now += seconds
+
+        original_sleep = asyncio.sleep
+        self.sleep = patch("bot.services.asyncio.sleep", side_effect=sleep)
+        self.sleep_mock = self.sleep.start()
+        self.addCleanup(self.sleep.stop)
+        self.seen = []
+        self.statuses = {"primary": 503}
+        self.headers = {}
+
+        async def handler(request):
+            model = request.url.path.split("/")[-1].split(":")[0]
+            self.seen.append((model, self.now))
+            await original_sleep(0)
+            return httpx.Response(self.statuses.get(model, 200), headers=self.headers, json={
+                "candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({
+                    "full_name": "Jane Doe", "email": "jane@example.com"})}]}}]})
+
+        self.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(self.client.aclose)
+        self.parser = Parser("key", "primary", self.client, ("lite", "smallest"))
+
+    async def parse(self):
+        return await self.parser.parse("Jane Doe jane@example.com")
+
+    async def test_fallback_order_spacing_and_shared_cooldown(self):
+        self.statuses["lite"] = 503
+        self.assertEqual(await self.parse(), ("Jane Doe", "jane@example.com"))
+        self.assertEqual([model for model, _ in self.seen], ["primary", "lite", "smallest"])
+        await self.parse()
+        self.assertEqual([model for model, _ in self.seen], ["primary", "lite", "smallest", "smallest"])
+        self.assertTrue(all(b[1] - a[1] >= 1 for a, b in zip(self.seen, self.seen[1:])))
+
+    async def test_all_unavailable_stop_requests_until_cooldown_then_recover(self):
+        self.statuses.update(lite=503, smallest=503)
+        with self.assertRaises(ServiceError):
+            await self.parse()
+        for _ in range(5):
+            with self.assertRaises(ServiceError):
+                await self.parse()
+        self.assertEqual(len(self.seen), 3)
+        self.now = max(self.parser.retry_at.values())
+        self.statuses.clear()
+        self.assertEqual(await self.parse(), ("Jane Doe", "jane@example.com"))
+        self.assertEqual(self.seen[-1][0], "primary")
+        self.assertNotIn("primary", self.parser.failures)
+
+    async def test_concurrent_messages_share_failure_state(self):
+        await asyncio.gather(*(self.parse() for _ in range(5)))
+        self.assertEqual([model for model, _ in self.seen].count("primary"), 1)
+        self.assertEqual([model for model, _ in self.seen].count("lite"), 5)
+
+    async def test_backoff_grows_and_honors_retry_after(self):
+        self.headers = {"Retry-After": "300"}
+        await self.parse()
+        self.assertGreaterEqual(self.parser.retry_at["primary"], 1300)
+        self.headers = {"Retry-After": "invalid"}
+        self.now = self.parser.retry_at["primary"]
+        await self.parse()
+        self.assertGreaterEqual(self.parser.retry_at["primary"], self.now + 119)
+        self.assertEqual(self.parser.failures["primary"], 2)
+
+    async def test_retry_after_http_date(self):
+        self.headers = {"Retry-After": "Thu, 01 Jan 1970 01:00:00 GMT"}
+        with patch("bot.services.time.time", return_value=1000):
+            await self.parse()
+        self.assertEqual(self.parser.retry_at["primary"], 3600)
+
+    async def test_rate_limits_cool_down_and_fatal_errors_do_not_fan_out(self):
+        self.statuses["primary"] = 429
+        await self.parse()
+        self.assertIn("primary", self.parser.retry_at)
+        self.now = self.parser.retry_at["primary"]
+        self.statuses["primary"] = 403
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self.parse()
+        self.assertEqual([model for model, _ in self.seen], ["primary", "lite", "primary"])
+
+
 class ConfigTest(unittest.TestCase):
     def load(self, **overrides):
         env = dict(DISCORD_TOKEN="test", DISCORD_GUILD_ID="1", DISCORD_MEMBER_ROLE_ID="2",
@@ -281,6 +445,15 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(getattr(self.load(**{key: "custom_column"}), field + "_column"), "custom_column")
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.load(**{key: "column; DROP TABLE People"})
+
+    def test_gemini_fallback_configuration(self):
+        self.assertEqual(self.load().fallback_models, ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"))
+        self.assertEqual(self.load(GEMINI_FALLBACK_MODELS=" lite, tiny,lite ").fallback_models, ("lite", "tiny"))
+        self.assertEqual(self.load(GEMINI_FALLBACK_MODELS="").fallback_models, ())
+        self.assertEqual(self.load(GEMINI_MODEL="gemini-3.1-flash-lite").fallback_models, ())
+        for value in ("models/lite", "one,two,three,four"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.load(GEMINI_FALLBACK_MODELS=value)
 
     def test_resource_defaults_and_overrides(self):
         config = self.load()
@@ -406,7 +579,7 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.bot = VerificationBot(self.config)
         self.role = SimpleNamespace(id=2)
         self.bot.role = lambda guild: self.role
-        self.bot.d1 = SimpleNamespace(matches=AsyncMock(return_value=False))
+        self.bot.d1 = SimpleNamespace(matches=AsyncMock(return_value=False), refresh=AsyncMock(return_value=False))
         self.bot.parser = SimpleNamespace(parse=AsyncMock(return_value=("Jane Doe", "jane@example.com")))
         self.member = SimpleNamespace(id=3, guild=SimpleNamespace(id=1), bot=False, pending=False, roles=[], nick=None, global_name="Unknown", name="unknown", send=AsyncMock(), add_roles=AsyncMock())
         self.guild = SimpleNamespace(id=1, fetch_member=AsyncMock(return_value=self.member), get_member=lambda user_id: self.member if user_id == 3 else None)
@@ -426,6 +599,36 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.bot.state = State(self.config.state_file)
         await self.bot.check_member(self.member)
         self.member.send.assert_awaited_once()
+
+    async def test_only_join_events_can_trigger_early_d1_refresh(self):
+        await self.bot.on_member_join(self.member)
+        self.bot.d1.refresh.assert_awaited_once_with(join_names=("Unknown", "unknown"))
+        self.bot.d1.refresh.reset_mock()
+        self.bot.state.update(3, next_check=0)
+        await self.bot.check_member(self.member)
+        before = SimpleNamespace(**{**vars(self.member), "nick": "Old"})
+        await self.bot.on_member_update(before, self.member)
+        before_user = SimpleNamespace(name="Old", global_name="Old")
+        await self.bot.on_user_update(before_user, self.member)
+        msg = SimpleNamespace(author=self.member, content="Jane Doe jane@example.com",
+                              channel=SimpleNamespace(send=AsyncMock()))
+        await self.bot.handle_dm(msg)
+        self.bot.d1.refresh.assert_not_awaited()
+
+    async def test_pending_new_join_refreshes_but_does_not_grant_until_screened(self):
+        self.member.pending = True
+        await self.bot.on_member_join(self.member)
+        self.bot.d1.refresh.assert_awaited_once()
+        self.bot.d1.matches.assert_not_awaited()
+        self.member.add_roles.assert_not_awaited()
+
+    async def test_bot_and_other_guild_joins_do_not_refresh(self):
+        self.member.bot = True
+        await self.bot.on_member_join(self.member)
+        self.member.bot = False
+        self.guild.id = 999
+        await self.bot.on_member_join(self.member)
+        self.bot.d1.refresh.assert_not_awaited()
 
     async def test_reminder_boundary_survives_restart_and_name_changes(self):
         with patch("bot.__main__.time.time", return_value=1000) as now:

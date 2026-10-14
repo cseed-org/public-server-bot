@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+DEFAULT_FALLBACK_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+
+
 def identifier(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
         raise ValueError("D1 table/column names must be simple SQL identifiers")
@@ -40,6 +43,7 @@ class Config:
     max_concurrent_api: int = 2
     max_api_per_minute: int = 60
     cache_file: Path = Path("data/members.sqlite3")
+    fallback_models: tuple[str, ...] = DEFAULT_FALLBACK_MODELS
 
     @classmethod
     def load(cls):
@@ -59,11 +63,21 @@ class Config:
             if not 1 <= value <= maximum:
                 raise ValueError(f"{key} must be an integer between 1 and {maximum}")
             return value
+        model = required("GEMINI_MODEL")
+        defaults = DEFAULT_FALLBACK_MODELS
+        if model in defaults:
+            defaults = defaults[defaults.index(model) + 1:]
+        fallbacks = tuple(dict.fromkeys(name.strip() for name in
+                         os.getenv("GEMINI_FALLBACK_MODELS", ",".join(defaults)).split(",") if name.strip()))
+        if len(fallbacks) > 3:
+            raise ValueError("GEMINI_FALLBACK_MODELS must contain at most three models")
+        if any(not re.fullmatch(r"[A-Za-z0-9._-]+", name) for name in (model, *fallbacks)):
+            raise ValueError("Invalid Gemini model name")
         config = cls(
             required("DISCORD_TOKEN"), int(required("DISCORD_GUILD_ID")),
             int(required("DISCORD_MEMBER_ROLE_ID")), required("CLOUDFLARE_ACCOUNT_ID"),
             required("CLOUDFLARE_D1_DATABASE_ID"), required("CLOUDFLARE_API_TOKEN"),
-            required("GEMINI_API_KEY"), required("GEMINI_MODEL"),
+            required("GEMINI_API_KEY"), model,
             os.getenv("D1_TABLE", "People"),
             os.getenv("D1_FIRST_NAME_COLUMN", "first_name"),
             os.getenv("D1_LAST_NAME_COLUMN", "last_name"),
@@ -81,6 +95,7 @@ class Config:
             bounded_integer("MAX_CONCURRENT_API", "2", 16),
             bounded_integer("MAX_API_PER_MINUTE", "60", 600),
             Path(os.getenv("MEMBERSHIP_CACHE_DB", "data/members.sqlite3")),
+            fallbacks,
         )
         for key, value in (("DISCORD_GUILD_ID", config.guild_id), ("DISCORD_MEMBER_ROLE_ID", config.role_id)):
             if not 0 < value < 2 ** 64:

@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 REFRESH_SECONDS = 6 * 60 * 60
+JOIN_REFRESH_SECONDS = 60
 
 
 class CacheUnavailable(Exception):
@@ -25,16 +26,24 @@ class MembershipCache:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 next_attempt REAL NOT NULL, valid_until REAL NOT NULL
             );
-            INSERT OR IGNORE INTO refresh VALUES (1, 0, 0);
+            INSERT OR IGNORE INTO refresh (id, next_attempt, valid_until) VALUES (1, 0, 0);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(refresh)")}
+        if "next_join_attempt" not in columns:
+            self.db.execute("ALTER TABLE refresh ADD COLUMN next_join_attempt REAL NOT NULL DEFAULT 0")
+            self.db.execute("""UPDATE refresh SET next_join_attempt=CASE
+                WHEN valid_until=next_attempt AND valid_until>0 THEN next_attempt-?+?
+                ELSE next_attempt END""", (REFRESH_SECONDS, JOIN_REFRESH_SECONDS))
+        self.db.commit()
 
-    def reserve_refresh(self, now):
+    def reserve_refresh(self, now, *, on_join=False):
         # Persist before the request: errors, concurrent callers and restarts
-        # must not produce another remote query during this six-hour window.
+        # must not produce another remote query after a failed refresh.
+        deadline = "next_join_attempt" if on_join else "next_attempt"
         with self.db:
             result = self.db.execute(
-                "UPDATE refresh SET next_attempt=? WHERE id=1 AND next_attempt<=?",
-                (now + REFRESH_SECONDS, now),
+                f"UPDATE refresh SET next_attempt=?, next_join_attempt=? WHERE id=1 AND {deadline}<=?",
+                (now + REFRESH_SECONDS, now + REFRESH_SECONDS, now),
             )
         return result.rowcount == 1
 
@@ -45,6 +54,14 @@ class MembershipCache:
             self.db.execute("DELETE FROM members")
             self.db.executemany("INSERT INTO members VALUES (?, ?, ?)", rows)
             self.db.execute("UPDATE refresh SET valid_until=next_attempt WHERE id=1")
+            self.db.execute("UPDATE refresh SET next_join_attempt=next_attempt-?+? WHERE id=1",
+                            (REFRESH_SECONDS, JOIN_REFRESH_SECONDS))
+
+    def contains_any_name(self, names):
+        # Presence, not uniqueness or freshness: ambiguous names are still found.
+        return any(self.db.execute(
+            "SELECT 1 FROM members WHERE lower(full_name)=lower(trim(?)) LIMIT 1", (name,)
+        ).fetchone() for name in names)
 
     def matches(self, name, email, now):
         valid_until = self.db.execute("SELECT valid_until FROM refresh WHERE id=1").fetchone()[0]

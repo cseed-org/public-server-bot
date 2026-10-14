@@ -76,7 +76,8 @@ class VerificationBot(discord.Client):
         self.ai_http = httpx.AsyncClient(timeout=30, limits=limits)
         self.membership_cache = MembershipCache(self.config.cache_file)
         self.d1 = D1(self.config, self.d1_http, self.membership_cache)
-        self.parser = Parser(self.config.gemini_key, self.config.model, self.ai_http)
+        self.parser = Parser(self.config.gemini_key, self.config.model, self.ai_http,
+                             self.config.fallback_models)
         await self.refresh_membership()
         self.refresh_membership.start()
         self.scan.change_interval(seconds=self.config.scan_seconds)
@@ -192,6 +193,14 @@ class VerificationBot(discord.Client):
         await self.wait_until_ready()
 
     async def on_member_join(self, member):
+        if member.guild.id != self.config.guild_id or member.bot:
+            return
+        names = tuple(dict.fromkeys(n for n in (member.nick, member.global_name, member.name) if n))
+        try:
+            if await self.d1.refresh(join_names=names):
+                log.info("Membership cache refreshed for new member")
+        except Exception as exc:
+            log.warning("Join membership refresh failed (%s); next attempt in six hours", error_summary(exc))
         await self.safe_check(member)
 
     async def on_member_update(self, before, after):

@@ -9,7 +9,9 @@ The membership source is the `People` table in `cseed-membership`. Full names ar
 
 See [the security review](SECURITY_REVIEW.md) for safeguards, accepted risks, and validation results. Do not use this matching policy to protect sensitive information or privileged operations.
 
-The bot downloads eligible names and emails from D1 on first startup, then at most once every six hours. All name and DM matching uses a local SQLite snapshot at `data/members.sqlite3`. It contains full names and the two email fields, plus a separate table of refresh deadlines; no other source fields are downloaded or stored. The optional status filter runs in D1. Refresh attempts are reserved on disk before the request, so failures and restarts do not bypass the six-hour limit. A background task checks the local deadline every minute, including when no members need verification.
+The bot downloads eligible names and emails from D1 when its six-hour refresh is due (including first startup), or when a new human member joins the configured Discord server and none of their Discord names is present in the local SQLite snapshot at `data/members.sqlite3`. Name changes, DMs, and routine member scans only use SQLite. A duplicate/ambiguous name counts as present but cannot grant a role by itself. Join-triggered refreshes share a persistent one-minute minimum interval after a successful refresh, so join bursts reuse the snapshot. Every refresh starts a new six-hour window; failed attempts block both refresh paths for six hours, including across restarts. A background task checks the local deadline every minute, including when no members need verification.
+
+The snapshot contains full names and the two email fields, plus a separate table of refresh deadlines; no other source fields are downloaded or stored. The optional status filter runs in D1. Refreshes are serialized, and their deadlines are reserved on disk before the request.
 
 Each successful refresh replaces the snapshot atomically, including removing deleted or newly ineligible records. An empty result clears it. If a refresh fails, the previous snapshot remains on disk but expired records cannot grant roles; verification resumes after a successful scheduled refresh. On an initial failure, verification is unavailable until the next attempt six hours later. Source or configuration changes become effective at the next successful refresh, followed by a member check; already assigned roles are not revoked.
 
@@ -89,8 +91,11 @@ Table and column names must start with a letter or underscore and contain only l
 1. Open [Google AI Studio](https://aistudio.google.com/apikey), select or create a project, and create an API key. If your existing project is not listed, follow Google's [API key setup instructions](https://ai.google.dev/gemini-api/docs/api-key) to import it.
 2. Copy the key into `GEMINI_API_KEY` in `.env`.
 3. Set `GEMINI_MODEL` to an API model ID available to that project with [structured output support](https://ai.google.dev/gemini-api/docs/structured-output). The template uses `gemini-3.8-flash`. Use the bare model ID, without a `models/` prefix, and confirm your project has quota for it.
+4. `GEMINI_FALLBACK_MODELS` is an ordered, comma-separated list of up to three lower-tier models. It defaults to `gemini-3.5-flash-lite,gemini-3.1-flash-lite`, which are listed in Google's [model catalog](https://ai.google.dev/gemini-api/docs/models). If the primary is already one of these models and no override is set, only subsequent models are used. Set it blank to disable fallback; verify access and quota for your chosen models.
 
 Gemini extracts a full name and email from a member's DM. Name-only checks search the local cache without Gemini, but both Gemini settings are required at startup. Review the data boundary below before deploying because verification DMs are sent to Google.
+
+On HTTP 503 or 429, the bot tries the next available fallback, at most once per model per DM. Gemini requests are serialized with at least one second between requests. Failed models are skipped across all users for an exponential cooldown starting at 60 seconds, doubling up to a one-hour base plus up to 10% jitter; a longer `Retry-After` is honored. If every model is cooling down, the bot returns a temporary error without contacting Gemini. These model cooldowns reset on process restart. Other HTTP errors and invalid model output fail verification without fallback.
 
 ### 5. Customize the messages
 
@@ -132,11 +137,12 @@ Optional settings and their defaults:
 | `D1_CS_EMAIL_COLUMN` | `cs_email` | CS email column; either email can match. |
 | `D1_STATUS_COLUMN` | Empty | Optional eligibility column. |
 | `D1_STATUS_VALUE` | `active` | Required value when a status column is configured. |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash-lite,gemini-3.1-flash-lite` | Ordered lower-tier fallbacks on 503/429; blank disables fallback. |
 | `MESSAGE_FILE` | `messages/verification.txt` | Verification request and reminder text. |
 | `ERROR_MESSAGE_FILE` | `messages/error.txt` | Temporary-error text. |
 | `FAILURE_MESSAGE_FILE` | `messages/verification_failed.txt` | Unsuccessful-verification text. |
 | `STATE_DB` | `data/state.sqlite3` | Local SQLite state, separate from D1. |
-| `MEMBERSHIP_CACHE_DB` | `data/members.sqlite3` | Local names/email snapshot and persistent six-hour refresh deadlines. |
+| `MEMBERSHIP_CACHE_DB` | `data/members.sqlite3` | Local names/email snapshot and persistent scheduled/join refresh deadlines. |
 | `SCAN_INTERVAL_SECONDS` | `900` | Seconds between scans of server members. |
 | `REMINDER_INTERVAL_HOURS` | `24` | Hours between automatic reminder attempts; values below 24 are rejected. |
 | `DM_COOLDOWN_SECONDS` | `60` | Separate per-user cooldowns for verification replies, automatic name checks, and command acknowledgments. |
@@ -186,7 +192,7 @@ DM parsing and automatic name checks have separate persistent per-user cooldowns
 
 At most two workflows run concurrently by default, each with a 60-second deadline. Duplicate events and work arriving at capacity are dropped; retry a DM later, while member checks retry on a later scan. Uncached users and users outside the configured server are ignored before any REST calls, replies, or state writes. The background scan loads the member cache after connection.
 
-Name checks and DM verification share a default budget of 60 workflows per rolling minute. A name workflow performs at most four local cache lookups; a DM workflow performs at most one Gemini call and two local lookups. Successful matches are checked again after fetching current Discord membership, so an expired or replaced snapshot cannot authorize the subsequent role request. Ordinary DMs from cached role holders do not consume the verification budget. Neither workflow queries D1. The separate background refresh makes one D1 query per six-hour window. The workflow budget resets on process restart; per-user cooldowns and the D1 refresh deadline persist. Scans pause when the budget is exhausted so later members can still be checked. Rate limits constrain abuse but are not a daily spending cap; configure provider quotas as well.
+Name checks and DM verification share a default budget of 60 workflows per rolling minute. A name workflow performs at most four local cache lookups; a DM workflow performs at most one Gemini call per configured model (three total by default) and two local lookups. Successful matches are checked again after fetching current Discord membership, so an expired or replaced snapshot cannot authorize the subsequent role request. Ordinary DMs from cached role holders do not consume the verification budget. These matching workflows never query D1; only the six-hour background refresh or a new join with absent cached names can do so. The workflow budget resets on process restart; per-user cooldowns and the D1 refresh deadlines persist. Scans pause when the budget is exhausted so later members can still be checked. Rate limits constrain abuse but are not a daily spending cap; configure provider quotas as well.
 
 Invalid, missing, or ambiguous details produce a generic failure without revealing whether a name/email exists. An administrator should monitor logs for configuration/API errors; logs record error types without message contents or API response bodies. Each D1 refresh downloads the complete eligible names/email snapshot in one request, so it must fit the provider's response limits and the bot's available memory. Membership, screening, target-role permissions, and the matched Discord name (for name-based checks) are checked again immediately before granting the role.
 
@@ -218,7 +224,7 @@ Measure actual usage with `docker compose stats bot` after startup and during a 
 
 ## Data boundary
 
-Gemini receives only a fixed extraction instruction, a JSON schema, and the user's current DM. It has no tools, D1 credentials, database records, Discord identifiers, conversation history, or verification results. Its only output is a name and email. The bot checks output types, lengths, email shape, and whether the extracted values appear in the original reply before passing them as bound local SQLite query parameters. D1 supplies only eligible full names and email fields during the scheduled refresh. Separate HTTP clients isolate service headers.
+Gemini receives only a fixed extraction instruction, a JSON schema, and the user's current DM. It has no tools, D1 credentials, database records, Discord identifiers, conversation history, or verification results. Its only output is a name and email. The bot checks output types, lengths, email shape, and whether the extracted values appear in the original reply before passing them as bound local SQLite query parameters. D1 supplies only eligible full names and email fields during scheduled or join-triggered refreshes. Separate HTTP clients isolate service headers.
 
 The submitted DM itself contains personal information and is sent to Google for parsing; database privacy does not mean the submitted details stay local. Raw replies and extracted DM details are not persisted or logged. Discord and Google have their own data handling policies. The state database stores Discord user IDs, opt-out flags, and timing fields. The separate membership cache persists names and emails downloaded from D1, with no Discord IDs or links to user records. Protect the cache and its backups as personal data. Service credentials remain in the bot process, never in model requests except the Gemini API key authentication header.
 
