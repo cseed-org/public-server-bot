@@ -11,7 +11,7 @@ from discord.ext import tasks
 
 from .config import Config
 from .cache import MembershipCache
-from .services import D1, Parser, normalized, opted_out
+from .services import D1, Parser, GeminiCooldownError, GeminiResponseError, normalized, opted_out
 from .state import State
 
 log = logging.getLogger("verification")
@@ -19,6 +19,10 @@ log = logging.getLogger("verification")
 
 def error_summary(exc):
     # Only fixed service labels and status codes; never URLs or response bodies.
+    if isinstance(exc, GeminiCooldownError):
+        return "Gemini models cooling down (HTTP 429/503)"
+    if isinstance(exc, GeminiResponseError):
+        return "Gemini invalid or incomplete parser response"
     if isinstance(exc, httpx.HTTPStatusError):
         service = {
             "api.cloudflare.com": "Cloudflare D1",

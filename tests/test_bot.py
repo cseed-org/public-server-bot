@@ -14,7 +14,7 @@ import httpx
 
 from bot.config import Config, identifier
 from bot.cache import MembershipCache, CacheUnavailable, REFRESH_SECONDS
-from bot.services import D1, Parser, ServiceError, opted_out
+from bot.services import D1, Parser, ServiceError, GeminiCooldownError, GeminiResponseError, opted_out
 from bot.state import State
 from bot.__main__ import VerificationBot, error_summary
 
@@ -309,14 +309,47 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(await parser.parse(reply), ("Jane Doe", "jane@example.com"))
 
     async def test_parser_malformed_responses_are_service_errors(self):
-        bodies = [{"candidates": [None]}, {"candidates": ["invalid"]},
-                  {"candidates": [{"finishReason": "STOP", "content": {"parts": [None]}}]}]
+        bodies = [None, {}, {"candidates": []}, {"candidates": [None]}, {"candidates": ["invalid"]},
+                  {"candidates": [{"finishReason": "STOP", "content": {"parts": [None]}}]},
+                  {"candidates": [{"finishReason": "STOP", "content": {"parts": []}}]},
+                  {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": 42}]}}]}]
+        for output in ("not JSON", "[]", '{}',
+                       json.dumps({"full_name": "Jane Doe", "email": "jane@example.com", "verified": True}),
+                       json.dumps({"full_name": 42, "email": "jane@example.com"}),
+                       json.dumps({"full_name": "Jane Doe", "email": ["jane@example.com"]}),
+                       json.dumps({"full_name": None, "email": False})):
+            bodies.append({"candidates": [{"finishReason": "STOP",
+                                          "content": {"parts": [{"text": output}]}}]})
         for body in bodies:
             with self.subTest(body=body):
                 async with httpx.AsyncClient(transport=httpx.MockTransport(
-                        lambda request: httpx.Response(200, json=body))) as client:
-                    with self.assertRaises(ServiceError):
+                        lambda request: httpx.Response(200, content=json.dumps(body)))) as client:
+                    with self.assertRaises(GeminiResponseError):
                         await Parser("ai-key", "test-model", client).parse("Jane Doe jane@example.com")
+
+    async def test_parser_rejects_unfinished_output_even_with_valid_identity_json(self):
+        for finish in (None, "MAX_TOKENS", "SAFETY", "RECITATION", "unknown-private-value"):
+            with self.subTest(finish=finish):
+                body = {"candidates": [{"finishReason": finish, "content": {"parts": [{
+                    "text": json.dumps({"full_name": "Jane Doe", "email": "jane@example.com"}),
+                }]}}]}
+                async with httpx.AsyncClient(transport=httpx.MockTransport(
+                        lambda request: httpx.Response(200, json=body))) as client:
+                    with self.assertRaises(GeminiResponseError):
+                        await Parser("ai-key", "test-model", client).parse("Jane Doe jane@example.com")
+
+    async def test_parser_accepts_null_fields_and_ignores_thought_parts(self):
+        for name, email in ((None, None), ("Jane Doe", None), (None, "jane@example.com"),
+                            ("Jane Doe", "jane@example.com")):
+            with self.subTest(name=name, email=email):
+                body = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                    {"thought": True, "text": "Private reasoning, not JSON"},
+                    {"text": json.dumps({"full_name": name, "email": email})},
+                ]}}]}
+                async with httpx.AsyncClient(transport=httpx.MockTransport(
+                        lambda request: httpx.Response(200, json=body))) as client:
+                    result = await Parser("ai-key", "test-model", client).parse("Jane Doe jane@example.com")
+                self.assertEqual(result, (name, email) if name and email else None)
 
     async def test_parser_uses_generate_content_response_format_enum(self):
         def handler(request):
@@ -383,10 +416,10 @@ class ParserFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_unavailable_stop_requests_until_cooldown_then_recover(self):
         self.statuses.update(lite=503, smallest=503)
-        with self.assertRaises(ServiceError):
+        with self.assertRaises(GeminiCooldownError):
             await self.parse()
         for _ in range(5):
-            with self.assertRaises(ServiceError):
+            with self.assertRaises(GeminiCooldownError):
                 await self.parse()
         self.assertEqual(len(self.seen), 3)
         self.now = max(self.parser.retry_at.values())
@@ -696,6 +729,41 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         response = httpx.Response(403, request=request)
         error = httpx.HTTPStatusError("secret", request=request, response=response)
         self.assertEqual(error_summary(error), "Cloudflare D1 HTTP 403")
+
+    async def test_dm_parser_failures_log_safe_specific_labels_and_do_not_grant(self):
+        cases = (
+            (429, {}, "Gemini models cooling down (HTTP 429/503)"),
+            (503, {}, "Gemini models cooling down (HTTP 429/503)"),
+            (200, {"candidates": [{"finishReason": "MAX_TOKENS"}]},
+             "Gemini invalid or incomplete parser response"),
+            (200, {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                {"text": "private member details, not JSON"},
+            ]}}]}, "Gemini invalid or incomplete parser response"),
+        )
+        for status, body, label in cases:
+            with self.subTest(status=status, body=body):
+                self.bot.state.update(3, next_reply=0)
+                channel = MagicMock(spec=discord.DMChannel)
+                channel.send = AsyncMock()
+                msg = SimpleNamespace(author=self.member, content="Jane Doe jane@example.com", channel=channel)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(
+                        lambda request: httpx.Response(status, json=body))) as client:
+                    self.bot.parser = Parser("private-api-key", "test-model", client)
+                    with self.assertLogs("verification", level="WARNING") as logs:
+                        await self.bot.on_message(msg)
+                self.assertEqual(logs.output, [f"WARNING:verification:DM handling failed ({label})"])
+                channel.send.assert_awaited_once_with(self.config.message("error"))
+                self.bot.d1.matches.assert_not_awaited()
+                self.member.add_roles.assert_not_awaited()
+
+        # Exception messages, causes, and arbitrary service errors must stay private.
+        for error, expected in (
+            (GeminiCooldownError("private-api-key"), "Gemini models cooling down (HTTP 429/503)"),
+            (GeminiResponseError("private member details"), "Gemini invalid or incomplete parser response"),
+            (ServiceError("private service response"), "ServiceError"),
+        ):
+            error.__cause__ = ValueError("private response body")
+            self.assertEqual(error_summary(error), expected)
 
     async def test_matching_name_grants_role_without_ai_or_dm(self):
         self.bot.d1.matches.return_value = True
